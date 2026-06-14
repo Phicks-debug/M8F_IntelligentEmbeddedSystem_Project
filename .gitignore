@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Virtual environment
+.venv/
+venv/
+.env
+
+# Downloaded data and processed output (only the small subset lives here)
+data/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Generated metadata
+metadata/
