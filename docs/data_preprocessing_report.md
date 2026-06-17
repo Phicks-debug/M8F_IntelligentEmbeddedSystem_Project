@@ -36,13 +36,13 @@ flowchart LR
 
     CLS_AUG -->|11| VIZ["sample grid"]
     SPLIT -->|12| CSV["metadata.csv"]
-    CSV -->|13| DONE["handoff → training"]
+    CSV -->|13| DONE["handoff -> training"]
 ```
 
 **Outputs consumed by:**
 
-- `train_classification.ipynb` → `data/processed/classification_data_aug/`
-- `train_detection.ipynb` → `data/processed/detection_data/`
+- `train_classification.ipynb` -> `data/processed/classification_data_aug/`
+- `train_detection.ipynb` -> `data/processed/detection_data/`
 
 ---
 
@@ -220,9 +220,9 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 ### Step 11 — Visualization (`step-8-code`)
 
-**What:** Displays a 3-column grid (original | preprocessed (raw) | augmented) for up to 6 species. Shows the same image at different pipeline stages.
+**What:** Displays a 4-column grid (original | preprocessed (raw) | augmented | model-input (256->224)) for up to 6 species. Shows the same image at four pipeline stages, including the in-memory PIL preview of what the dataloader feeds the model at eval time (`Resize(short=256) -> CenterCrop(224)`). The model-input preview is computed in-memory from the raw file -- **no new files are written to disk**.
 
-**Note:** The "preprocessed" column is a verbatim copy on disk — no resize. The dataloader resizes each batch to 224×224 at train time via `Resize(256) → CenterCrop(224)` for eval and `RandomResizedCrop(224)` for train. Pre-resizing on disk would force the model to upscale a 224px image back to 256px at eval, degrading quality.
+**Note:** The "preprocessed" column is a verbatim copy on disk — no resize. The dataloader resizes each batch to 224×224 at train time via `Resize(256) -> CenterCrop(224)` for eval and `RandomResizedCrop(224)` for train. Pre-resizing on disk would force the model to upscale a 224px image back to 256px at eval, degrading quality.
 
 **Why:** Sanity check — verifies preprocessing and augmentation look reasonable before training.
 
@@ -235,7 +235,7 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 ### Step 12 — Save Metadata (`code-16`)
 
-**What:** Saves `metadata.csv` with `pipeline_version` column and timestamped atomic write (`out_tmp → out`).
+**What:** Saves `metadata.csv` with `pipeline_version` column and timestamped atomic write (`out_tmp -> out`).
 
 **Why:** `pipeline_version` enables tracking which pipeline produced which dataset. Atomic write prevents partial files if the cell is interrupted.
 
@@ -254,9 +254,9 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 - **`train_classification.ipynb`** — local / Apple Silicon consumer. Uses a **bare module-level config block** (not a `@dataclass`), matching the user's preferred notebook style:
   - `data_dir = Path('data/processed/classification_data')` — points at the **raw** split-organized tree, *not* `classification_data_aug/`.
-  - The `ensure_classification_data()` cell materializes the dataset on disk in two possible forms: real **copies** when Step 8 has already populated `classification_data/`, or a metadata-driven **symlink overlay** from `data/raw/<source>/<Species>/<file>` → `data/processed/classification_data/<split>/<raw_species>/<file>` when run on a fresh project. In the symlink-overlay case, the dataset is a thin overlay (no duplicate copies); in the real-copies case, the helper detects those pre-existing files and creates zero symlinks. Both forms are read transparently.
+  - The `ensure_classification_data()` cell materializes the dataset on disk in two possible forms: real **copies** when Step 8 has already populated `classification_data/`, or a metadata-driven **symlink overlay** from `data/raw/<source>/<Species>/<file>` -> `data/processed/classification_data/<split>/<raw_species>/<file>` when run on a fresh project. In the symlink-overlay case, the dataset is a thin overlay (no duplicate copies); in the real-copies case, the helper detects those pre-existing files and creates zero symlinks. Both forms are read transparently.
   - All hyperparameters (`num_classes`, `image_size`, `ft_arch`, `teacher_arch`, `ft_*`, `distill_*`, `seed`, `patience`, `workers`) are bare-name module-level constants in the config cell.
-  - Device selection auto-falls back through `cuda` → `mps` → `cpu` (Apple Silicon supported).
+  - Device selection auto-falls back through `cuda` -> `mps` -> `cpu` (Apple Silicon supported).
 - **`train_classification.py`** — cloud-GPU consumer. Uses `@dataclass Config` and points at `data/processed/classification_data_aug/` (the augmented copies); run this script on a CUDA host.
 - **`train_detection.ipynb`** — unchanged; points at `data/processed/detection_data/`.
 
