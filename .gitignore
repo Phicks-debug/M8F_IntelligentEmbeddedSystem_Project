@@ -230,3 +230,5 @@ data/
 
 # Generated metadata
 metadata/
+checkpoints/
+exported_models/
