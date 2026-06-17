@@ -220,7 +220,9 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 ### Step 11 — Visualization (`step-8-code`)
 
-**What:** Displays a 3-column grid (original | preprocessed 224×224 | augmented) for up to 6 species. Shows the same image at different pipeline stages.
+**What:** Displays a 3-column grid (original | preprocessed (raw) | augmented) for up to 6 species. Shows the same image at different pipeline stages.
+
+**Note:** The "preprocessed" column is a verbatim copy on disk — no resize. The dataloader resizes each batch to 224×224 at train time via `Resize(256) → CenterCrop(224)` for eval and `RandomResizedCrop(224)` for train. Pre-resizing on disk would force the model to upscale a 224px image back to 256px at eval, degrading quality.
 
 **Why:** Sanity check — verifies preprocessing and augmentation look reasonable before training.
 
