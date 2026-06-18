@@ -224,11 +224,14 @@ venv/
 
 # Downloaded data and processed output (only the small subset lives here)
 data/
+dataset/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
 
 # Generated metadata
 metadata/
+
+runs/
 checkpoints/
 exported_models/

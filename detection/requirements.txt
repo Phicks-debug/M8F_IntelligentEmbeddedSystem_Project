@@ -1,0 +1,5 @@
+ultralytics
+kaggle
+kagglehub
+ipykernel
+onnx
