@@ -36,13 +36,13 @@ flowchart LR
 
     CLS_AUG -->|11| VIZ["sample grid"]
     SPLIT -->|12| CSV["metadata.csv"]
-    CSV -->|13| DONE["handoff → training"]
+    CSV -->|13| DONE["handoff -> training"]
 ```
 
 **Outputs consumed by:**
 
-- `train_classification.ipynb` → `data/processed/classification_data_aug/`
-- `train_detection.ipynb` → `data/processed/detection_data/`
+- `train_classification.ipynb` -> `data/processed/classification_data_aug/`
+- `train_detection.ipynb` -> `data/processed/detection_data/`
 
 ---
 
@@ -62,7 +62,7 @@ flowchart LR
 
 ### Step 2 — Paths & Config (`code-4`)
 
-**What:** Defines `RAW_DIR`, `PROCESSED_DIR`, `CLASSIFICATION_DIR`, `DETECTION_DIR`, `TARGET_SPECIES` (8 species), `SUBSET_PER_SPECIES=50`.
+**What:** Defines `RAW_DIR`, `PROCESSED_DIR`, `CLASSIFICATION_DIR`, `DETECTION_DIR`, `TARGET_SPECIES` (8 species).
 
 **Why:** Central config makes it easy to change species or limits without hunting through cells.
 
@@ -101,15 +101,11 @@ flowchart LR
 
 ---
 
-### Step 5 — Filter & Subset (`code-8`)
+### Step 5 — Filter (`code-8`)
 
-**What:** Filters to `TARGET_SPECIES`, then caps at `SUBSET_PER_SPECIES=50` per (species, source) pair using random `.sample()` with fixed `random_state`.
+**What:** Filters the metadata to the 8 `TARGET_SPECIES`. Every image that survives this step is retained; there is no per-(species, source) sub-cap.
 
-**Why:** Ensures balanced representation across species and sources. Random sampling avoids bias that `.head()` would introduce (e.g. always picking the first 50 alphabetically).
-
-**Notes:**
-
-- Set `SUBSET_PER_SPECIES = None` to use the full dataset once the prototype is validated.
+**Why:** Restricts the working dataset to just the species of interest so every downstream step (split, augmentation, training, detection) operates on the same reduced universe.
 
 ---
 
@@ -224,7 +220,9 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 ### Step 11 — Visualization (`step-8-code`)
 
-**What:** Displays a 3-column grid (original | preprocessed 224×224 | augmented) for up to 6 species. Shows the same image at different pipeline stages.
+**What:** Displays a 4-column grid (original | preprocessed (raw) | augmented | model-input (256->224)) for up to 6 species. Shows the same image at four pipeline stages, including the in-memory PIL preview of what the dataloader feeds the model at eval time (`Resize(short=256) -> CenterCrop(224)`). The model-input preview is computed in-memory from the raw file -- **no new files are written to disk**.
+
+**Note:** The "preprocessed" column is a verbatim copy on disk — no resize. The dataloader resizes each batch to 224×224 at train time via `Resize(256) -> CenterCrop(224)` for eval and `RandomResizedCrop(224)` for train. Pre-resizing on disk would force the model to upscale a 224px image back to 256px at eval, degrading quality.
 
 **Why:** Sanity check — verifies preprocessing and augmentation look reasonable before training.
 
@@ -237,7 +235,7 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 ### Step 12 — Save Metadata (`code-16`)
 
-**What:** Saves `metadata.csv` with `pipeline_version` column and timestamped atomic write (`out_tmp → out`).
+**What:** Saves `metadata.csv` with `pipeline_version` column and timestamped atomic write (`out_tmp -> out`).
 
 **Why:** `pipeline_version` enables tracking which pipeline produced which dataset. Atomic write prevents partial files if the cell is interrupted.
 
@@ -250,13 +248,17 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 ### Step 13 — Handoff (`md-17`)
 
-**What:** Points downstream notebooks at the augmented classification dataset and auto-labeled detection dataset.
+**What:** Points downstream notebooks at the appropriate datasets and documents the config style each consumer uses.
 
 **Notes:**
 
-- Open `train_classification.ipynb` → point at `classification_data_aug/`.
-- Open `train_detection.ipynb` → point at `detection_data/`.
-- Set `SUBSET_PER_SPECIES = None` to use the full dataset once prototype is validated.
+- **`train_classification.ipynb`** — local / Apple Silicon consumer. Uses a **bare module-level config block** (not a `@dataclass`), matching the user's preferred notebook style:
+  - `data_dir = Path('data/processed/classification_data')` — points at the **raw** split-organized tree, *not* `classification_data_aug/`.
+  - The `ensure_classification_data()` cell materializes the dataset on disk in two possible forms: real **copies** when Step 8 has already populated `classification_data/`, or a metadata-driven **symlink overlay** from `data/raw/<source>/<Species>/<file>` -> `data/processed/classification_data/<split>/<raw_species>/<file>` when run on a fresh project. In the symlink-overlay case, the dataset is a thin overlay (no duplicate copies); in the real-copies case, the helper detects those pre-existing files and creates zero symlinks. Both forms are read transparently.
+  - All hyperparameters (`num_classes`, `image_size`, `ft_arch`, `teacher_arch`, `ft_*`, `distill_*`, `seed`, `patience`, `workers`) are bare-name module-level constants in the config cell.
+  - Device selection auto-falls back through `cuda` -> `mps` -> `cpu` (Apple Silicon supported).
+- **`train_classification.py`** — cloud-GPU consumer. Uses `@dataclass Config` and points at `data/processed/classification_data_aug/` (the augmented copies); run this script on a CUDA host.
+- **`train_detection.ipynb`** — unchanged; points at `data/processed/detection_data/`.
 
 ---
 
@@ -266,8 +268,8 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 | --- | --- | --- | --- |
 | Raw images | `data/raw/<source>/<Species>/` | JPEG/PNG | — |
 | Metadata | `data/processed/metadata.csv` | CSV | Debugging |
-| Classification (raw) | `data/processed/classification_data/` | JPEG/PNG | — |
-| Classification (aug) | `data/processed/classification_data_aug/` | JPEG | `train_classification.ipynb` |
+| Classification (raw) | `data/processed/classification_data/` | JPEG/PNG (copies or symlinks) | `train_classification.ipynb` |
+| Classification (aug) | `data/processed/classification_data_aug/` | JPEG | `train_classification.py` |
 | Auto-labels | `data/processed/auto_labels.json` | JSON | Step 10b |
 | Detection dataset | `data/processed/detection_data/` | YOLO | `train_detection.ipynb` |
 | Review list | `data/processed/review_list.tsv` | TSV | LabelImg/Roboflow |
@@ -276,7 +278,8 @@ Outputs to `data/processed/classification_data_aug/` (parallel directory — raw
 
 ## Key Design Decisions
 
-1. **Two output trees** — `classification_data/` (raw copies) and `classification_data_aug/` (augmented) coexist so raw splits are never mutated.
+1. **Two output trees** — `classification_data/` and `classification_data_aug/` (augmented) coexist so the **raw splits are never mutated** by the augmentation pipeline. `classification_data/` is a split-organized tree whose on-disk form depends on run order: real **copies** when Step 8 ran first (the notebook's `ensure_classification_data()` then detects pre-existing files via its `dst.exists()` / `dst.is_symlink()` gate and creates zero symlinks in that case), or a metadata-driven **symlink overlay** onto `data/raw/` when the notebook ran first on a fresh project. Both formats are read transparently by the downstream training consumer. In the symlink-overlay case, editing a path under `classification_data/` writes through to `data/raw/<source>/<Species>/<file>` (treat the raw tree as read-only when running the notebook first).
 2. **Idempotency via existence checks** — all copy/augment/write steps skip existing files so re-running the notebook is safe.
 3. **Deterministic with `RANDOM_SEED`** — Steps 1-7 are fully deterministic. Step 9+ uses `np.random.seed()` internally (not fully deterministic across runs but reproducible within a run).
 4. **Multi-source design** — each API fetcher is independent; adding a new source requires one new fetcher cell + one line in `SOURCES`.
+5. **Per-consumer on-disk form** — `train_classification.ipynb` consumes `classification_data/`, which is real **copies** when Step 8 ran first, or a metadata-driven **symlink overlay** onto `data/raw/` when the notebook ran first on a fresh project; both formats read transparently. The helper cell is idempotent and heals broken links on re-run. `train_classification.py` consumes `classification_data_aug/` directly (the augmented copies already on disk from Step 9).
