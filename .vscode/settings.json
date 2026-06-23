@@ -26,7 +26,7 @@
     "**/.pytest_cache": true,
     "**/.ipynb_checkpoints": true,
     "**/checkpoints": true,
-    "**/exported_models": true,
+    // "**/exported_models": true,
     "**/mlruns": true
   }
 }

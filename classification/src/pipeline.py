@@ -2,9 +2,7 @@
 Pipeline stage runners for mushroom classification.
 """
 
-from __future__ import annotations
-
-import copy
+import json
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -17,6 +15,7 @@ from src.core import (
     _live_mem_snapshot,
     benchmark_latency,
     build_scheduler,
+    class_weights_from_counts,
     count_flops,
     count_params,
     evaluate,
@@ -31,8 +30,19 @@ from src.core import (
     train_one_epoch,
     try_load_resume_state,
 )
+from src.reporting import (
+    evaluate_with_predictions,
+    plot_benchmark_comparison,
+    plot_confidence_analysis,
+    plot_confusion_matrix,
+    plot_training_curves,
+    print_benchmark_table,
+    save_history,
+)
 from src.tracking import log_artifact, log_metrics, log_params
-from src.utils import get_device
+from src.utils import get_device, sync_runtime_outputs
+
+DEFAULT_QUANTIZE_BACKEND = "torchao_int8_static_activation_int8_weight"
 
 
 def _last_ckpt_path(best_path: Path) -> Path:
@@ -82,17 +92,14 @@ def _run_probe(
     probe_epochs: int,
     device: str,
     mixed_precision: bool,
-) -> float:
-    """Phase A: head-only probe training shared by `run_train_teacher` and
-    `run_finetune`. Freezes params whose name does NOT satisfy
-    `freeze_predicate(name)`, builds `opt_probe` (AdamW on the trainable
-    subset) with `CrossEntropyLoss(label_smoothing)`, runs `probe_epochs`
-    of standard train/val on the probe loaders, and logs the best probe
-    val_acc. Returns the best probe val_acc.
+    lr_override: Optional[float] = None,
+) -> tuple[float, dict]:
+    """Head-only probe training shared by teacher and student stages.
 
-    Caller passes `probe_epochs` resolved from config (so the historical
-    asymmetry between the teacher default 5 and the student default 3 is
-    preserved).
+    Freezes parameters that do not satisfy ``freeze_predicate``, builds an
+    AdamW optimiser on the trainable subset, and runs a short probe.
+
+    Returns ``(best_probe_val_acc, history_dict)``.
     """
     for name, param in model.named_parameters():
         if not freeze_predicate(name):
@@ -100,27 +107,38 @@ def _run_probe(
 
     opt_probe = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg[cfg_key]["lr"],
+        lr=lr_override if lr_override is not None else cfg[cfg_key]["lr"],
         weight_decay=cfg[cfg_key]["weight_decay"],
     )
 
     print(f"\n[{banner}]")
+    history = {"epochs": [], "val_acc": []}
     best_probe = 0.0
     for epoch in range(1, probe_epochs + 1):
         train_one_epoch(
-            model, train_loader, crit, opt_probe, epoch, device,
+            model,
+            train_loader,
+            crit,
+            opt_probe,
+            epoch,
+            device,
             mixed_precision=mixed_precision,
         )
         _, val_acc = evaluate(
-            model, val_loader, eval_crit, device,
+            model,
+            val_loader,
+            eval_crit,
+            device,
             mixed_precision=mixed_precision,
         )
         print(f"  Probe epoch {epoch}: val_acc={val_acc:.4f}")
+        history["epochs"].append(epoch)
+        history["val_acc"].append(val_acc)
         if val_acc > best_probe:
             best_probe = val_acc
     print(f"  Best probe val_acc: {best_probe:.4f}")
     log_metrics({log_metric_key: best_probe})
-    return best_probe
+    return best_probe, history
 
 
 def _run_resumable_epoch_loop(
@@ -138,36 +156,45 @@ def _run_resumable_epoch_loop(
     *,
     teacher: Optional[nn.Module] = None,
     distill_cfg: Optional[dict] = None,
-) -> tuple[float, float]:
-    """Resume-aware training loop shared by `run_train_teacher` Phase B,
-    `run_finetune` Phase B, and `run_distill`'s main loop.
+    patience_override: Optional[int] = None,
+    lr_override: Optional[float] = None,
+) -> tuple[float, float, dict]:
+    """Resume-aware training loop shared by teacher, student, and distillation.
 
-    Builds optimizer + scheduler from ``cfg[cfg_key]``, restores from the
-    ``*.last.pth`` companion if present, runs the per-epoch train -> memory
-    snapshot -> validate -> log -> save-best-and-resume -> early-stop body,
-    then loads the best ckpt and evaluates on the test split.
+    Builds optimizer + scheduler, restores from ``*.last.pth`` if present,
+    runs the train/validate/early-stop loop, then loads the best checkpoint
+    and evaluates on the test split.
 
-    Returns ``(best_val_acc, test_acc)`` so the caller can log them with its
-    own prefix without leaking the helper's metric-naming convention.
+    Returns ``(best_val_acc, test_acc, history_dict)``.
     """
     device = model_device(model)
     opt = optim.AdamW(
         model.parameters(),
-        lr=cfg[cfg_key]["lr"],
+        lr=lr_override if lr_override is not None else cfg[cfg_key]["lr"],
         weight_decay=cfg[cfg_key]["weight_decay"],
     )
     sched = build_scheduler(opt, cfg[cfg_key]["warmup"], cfg[cfg_key]["epochs"])
     last_ckpt_path = _last_ckpt_path(ckpt_path)
     start_epoch, best_acc, stall = _try_resume(ckpt_path, model, opt, sched)
-    patience = cfg.get("patience", 10)
+    patience = (
+        patience_override if patience_override is not None else cfg.get("patience", 10)
+    )
     target_epochs = cfg[cfg_key]["epochs"]
+
+    history = {
+        "epochs": [],
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+    }
 
     if start_epoch < target_epochs:
         for epoch in range(start_epoch + 1, target_epochs + 1):
             train_kwargs: dict = {}
             if teacher is not None and distill_cfg is not None:
                 train_kwargs = {"teacher": teacher, "distill_cfg": distill_cfg}
-            train_one_epoch(
+            train_loss, train_acc = train_one_epoch(
                 model,
                 train_loader,
                 crit,
@@ -182,7 +209,7 @@ def _run_resumable_epoch_loop(
                 print(f"  {snap}")
             if sched is not None:
                 sched.step()
-            _, val_acc = evaluate(
+            val_loss, val_acc = evaluate(
                 model,
                 val_loader,
                 eval_crit,
@@ -191,6 +218,12 @@ def _run_resumable_epoch_loop(
             )
             print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
             log_metrics({log_metric_key: val_acc}, step=epoch)
+
+            history["epochs"].append(epoch)
+            history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
 
             if val_acc > best_acc:
                 best_acc = val_acc
@@ -222,7 +255,7 @@ def _run_resumable_epoch_loop(
         device,
         mixed_precision=mixed_precision,
     )
-    return best_acc, test_acc
+    return best_acc, test_acc, history
 
 
 def model_device(model: nn.Module) -> str:
@@ -238,7 +271,7 @@ def run_train_teacher(cfg: dict) -> Path:
     torch.manual_seed(cfg.get("seed", 42))
     mp = cfg["data"].get("mixed_precision", False)
 
-    train_probe, val_probe, _ = get_dataloaders(
+    train_probe, val_probe, _, class_counts = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
         image_size=cfg["data"]["image_size"],
         num_classes=cfg["data"]["num_classes"],
@@ -246,7 +279,7 @@ def run_train_teacher(cfg: dict) -> Path:
         workers=cfg["data"]["workers"],
         mixup=False,
     )
-    train_full, val_full, test_full = get_dataloaders(
+    train_full, val_full, test_full, _ = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
         image_size=cfg["data"]["image_size"],
         num_classes=cfg["data"]["num_classes"],
@@ -271,10 +304,13 @@ def run_train_teacher(cfg: dict) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / "teacher_for_distill.pth"
 
-    # Phase A: Probe
-    crit = nn.CrossEntropyLoss(label_smoothing=cfg["finetune"].get("smoothing", 0.0))
+    crit = nn.CrossEntropyLoss(
+        weight=class_weights_from_counts(class_counts, device),
+        label_smoothing=cfg["finetune"].get("smoothing", 0.0),
+    )
     eval_crit = nn.CrossEntropyLoss()
-    _run_probe(
+
+    _, probe_history = _run_probe(
         cfg=cfg,
         cfg_key="finetune",
         model=model,
@@ -290,12 +326,11 @@ def run_train_teacher(cfg: dict) -> Path:
         mixed_precision=mp,
     )
 
-    # Phase B: Full fine-tune
     print("\n[TEACHER FULL] Fine-tuning all parameters")
     for param in model.parameters():
         param.requires_grad_(True)
 
-    best_acc, test_acc = _run_resumable_epoch_loop(
+    best_acc, test_acc, full_history = _run_resumable_epoch_loop(
         cfg=cfg,
         cfg_key="finetune",
         model=model,
@@ -312,6 +347,16 @@ def run_train_teacher(cfg: dict) -> Path:
     log_metrics({"teacher_test_acc": test_acc, "teacher_best_val_acc": best_acc})
     log_artifact(ckpt_path)
 
+    history = {"probe": probe_history, "full": full_history, "test_acc": test_acc}
+    history_path = ckpt_dir / "teacher_history.json"
+    save_history(history, history_path)
+    plot_training_curves(
+        history,
+        ckpt_dir / "teacher_training_curves.png",
+        title="Teacher (EfficientNet-B3) Training Progress",
+    )
+    sync_runtime_outputs(cfg, "checkpoint_dir")
+
     return ckpt_path
 
 
@@ -321,7 +366,12 @@ def run_finetune(cfg: dict) -> Path:
     torch.manual_seed(cfg.get("seed", 42))
     mp = cfg["data"].get("mixed_precision", False)
 
-    train_probe, val_probe, _ = get_dataloaders(
+    light_aug = cfg["finetune"].get("light_augmentation", True)
+    student_lr = cfg["finetune"].get("student_lr", cfg["finetune"]["lr"])
+    student_patience = cfg["finetune"].get("student_patience", cfg.get("patience", 10))
+    cfg["finetune"]["lr"] = student_lr
+
+    train_probe, val_probe, _, class_counts = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
         image_size=cfg["data"]["image_size"],
         num_classes=cfg["data"]["num_classes"],
@@ -329,24 +379,28 @@ def run_finetune(cfg: dict) -> Path:
         workers=cfg["data"]["workers"],
         mixup=False,
     )
-    train_full, val_full, test_full = get_dataloaders(
+    train_full, val_full, test_full, _ = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
         image_size=cfg["data"]["image_size"],
         num_classes=cfg["data"]["num_classes"],
         batch_size=cfg["finetune"]["batch_size"],
         workers=cfg["data"]["workers"],
-        mixup=True,
+        mixup=not light_aug,
+        light_augmentation=light_aug,
     )
 
     model = make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"]).to(device)
     print(f"Student params: {count_params(model):,}")
+    print(f"  student_lr={student_lr}, light_aug={light_aug}, patience={student_patience}")
 
     log_params(
         {
             "finetune.arch": cfg["finetune"]["arch"],
             "finetune.epochs": cfg["finetune"]["epochs"],
-            "finetune.lr": cfg["finetune"]["lr"],
+            "finetune.lr": student_lr,
             "finetune.batch_size": cfg["finetune"]["batch_size"],
+            "finetune.light_augmentation": light_aug,
+            "finetune.student_patience": student_patience,
         }
     )
 
@@ -354,10 +408,14 @@ def run_finetune(cfg: dict) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / "mobilenetv4_finetuned.pth"
 
-    # Phase A: Probe
-    crit = nn.CrossEntropyLoss(label_smoothing=cfg["finetune"].get("smoothing", 0.0))
+    class_weights = class_weights_from_counts(class_counts, device)
+    crit = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=cfg["finetune"].get("smoothing", 0.0),
+    )
     eval_crit = nn.CrossEntropyLoss()
-    _run_probe(
+
+    _, probe_history = _run_probe(
         cfg=cfg,
         cfg_key="finetune",
         model=model,
@@ -371,14 +429,14 @@ def run_finetune(cfg: dict) -> Path:
         probe_epochs=cfg["finetune"].get("probe_epochs", 3),
         device=device,
         mixed_precision=mp,
+        lr_override=student_lr,
     )
 
-    # Phase B: Full fine-tune
     print("\n[FULL] Fine-tuning all parameters")
     for param in model.parameters():
         param.requires_grad_(True)
 
-    best_acc, test_acc = _run_resumable_epoch_loop(
+    best_acc, test_acc, full_history = _run_resumable_epoch_loop(
         cfg=cfg,
         cfg_key="finetune",
         model=model,
@@ -390,10 +448,22 @@ def run_finetune(cfg: dict) -> Path:
         ckpt_path=ckpt_path,
         mixed_precision=mp,
         log_metric_key="finetune_val_acc",
+        patience_override=student_patience,
+        lr_override=student_lr,
     )
     print(f"  Student test_acc: {test_acc:.4f}")
     log_metrics({"finetune_test_acc": test_acc, "finetune_best_val_acc": best_acc})
     log_artifact(ckpt_path)
+
+    history = {"probe": probe_history, "full": full_history, "test_acc": test_acc}
+    history_path = ckpt_dir / "student_history.json"
+    save_history(history, history_path)
+    plot_training_curves(
+        history,
+        ckpt_dir / "student_training_curves.png",
+        title="Student (MobileNetV4) Training Progress",
+    )
+    sync_runtime_outputs(cfg, "checkpoint_dir")
 
     return ckpt_path
 
@@ -422,7 +492,7 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
         load_checkpoint(student_ckpt, student, device)
         print(f"Loaded fine-tuned student from {student_ckpt}")
 
-    train, val, test = get_dataloaders(
+    train, val, test, _ = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
         image_size=cfg["data"]["image_size"],
         num_classes=cfg["data"]["num_classes"],
@@ -442,12 +512,6 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
         }
     )
 
-    opt = optim.AdamW(
-        student.parameters(),
-        lr=cfg["distill"]["lr"],
-        weight_decay=cfg["distill"]["weight_decay"],
-    )
-    build_scheduler(opt, cfg["distill"]["warmup"], cfg["distill"]["epochs"])
     crit = nn.CrossEntropyLoss(label_smoothing=cfg["finetune"].get("smoothing", 0.0))
     eval_crit = nn.CrossEntropyLoss()
 
@@ -457,7 +521,7 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / "mobilenetv4_distilled.pth"
 
-    best_acc, test_acc = _run_resumable_epoch_loop(
+    best_acc, test_acc, history = _run_resumable_epoch_loop(
         cfg=cfg,
         cfg_key="distill",
         model=student,
@@ -476,11 +540,325 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
     log_metrics({"distill_test_acc": test_acc, "distill_best_val_acc": best_acc})
     log_artifact(ckpt_path)
 
+    # Save training history & plot
+    history["test_acc"] = test_acc
+    history_path = ckpt_dir / "distill_history.json"
+    save_history(history, history_path)
+    plot_training_curves(
+        history,
+        ckpt_dir / "distill_training_curves.png",
+        title="Distilled Student Training Progress",
+    )
+    sync_runtime_outputs(cfg, "checkpoint_dir")
+
     return ckpt_path
 
 
 def _size_mb(path: Path) -> float:
     return path.stat().st_size / (1024 * 1024)
+
+
+def _quantize_backend(cfg: dict, checkpoint_path: Optional[Path] = None) -> str:
+    if checkpoint_path is not None and "quantized" in checkpoint_path.stem:
+        if checkpoint_path.exists():
+            try:
+                state = torch.load(
+                    checkpoint_path, map_location="cpu", weights_only=False
+                )
+                backend = state.get("backend")
+                if isinstance(backend, str):
+                    return backend
+            except Exception as exc:
+                print(
+                    f"  [WARN] Could not read quantization backend from "
+                    f"{checkpoint_path}: {exc}"
+                )
+        return cfg.get("quantize", {}).get("backend", DEFAULT_QUANTIZE_BACKEND)
+    return ""
+
+
+def _checkpoint_quantization_calibration(checkpoint_path: Path) -> Optional[dict]:
+    try:
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"  [WARN] Could not read calibration metadata from {checkpoint_path}: {exc}")
+        return None
+    calibration = state.get("calibration")
+    return calibration if isinstance(calibration, dict) else None
+
+
+def _calibrate_linear_activation_ranges(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    *,
+    max_batches: int,
+    mixed_precision: bool = False,
+) -> dict:
+    """Collect per-linear input ranges used by static activation INT8."""
+    from src.core import _amp_ctx
+
+    stats: dict[str, dict[str, float | int]] = {}
+    hooks = []
+
+    def make_hook(name: str):
+        def hook(_module, inputs, _output) -> None:
+            if not inputs:
+                return
+            act = inputs[0].detach().float()
+            min_val = float(act.min().item())
+            max_val = float(act.max().item())
+            sample_count = int(act.numel())
+            current = stats.setdefault(
+                name,
+                {
+                    "min": min_val,
+                    "max": max_val,
+                    "ndim": int(act.ndim),
+                    "samples": 0,
+                },
+            )
+            current["min"] = min(float(current["min"]), min_val)
+            current["max"] = max(float(current["max"]), max_val)
+            current["ndim"] = max(int(current["ndim"]), int(act.ndim))
+            current["samples"] = int(current["samples"]) + sample_count
+
+        return hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            hooks.append(module.register_forward_hook(make_hook(name)))
+
+    if not hooks:
+        raise RuntimeError("Static quantization calibration found no nn.Linear modules.")
+
+    model.eval()
+    seen_batches = 0
+    try:
+        with torch.inference_mode():
+            for images, _ in loader:
+                if seen_batches >= max_batches:
+                    break
+                images = images.to(device)
+                with _amp_ctx(device, mixed_precision):
+                    model(images)
+                seen_batches += 1
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    if seen_batches == 0:
+        raise ValueError("Calibration loader produced 0 batches.")
+
+    modules = {}
+    for name, values in stats.items():
+        min_val = float(values["min"])
+        max_val = float(values["max"])
+        max_abs = max(abs(min_val), abs(max_val))
+        scale = max(max_abs / 127.0, 1e-8)
+        modules[name] = {
+            "min": min_val,
+            "max": max_val,
+            "scale": scale,
+            "zero_point": None,
+            "ndim": int(values["ndim"]),
+            "samples": int(values["samples"]),
+        }
+
+    return {
+        "method": "linear_input_minmax_symmetric",
+        "batches": seen_batches,
+        "modules": modules,
+    }
+
+
+def _apply_quantization_backend(
+    model: nn.Module,
+    backend: str,
+    calibration: Optional[dict] = None,
+) -> tuple[nn.Module, dict]:
+    if backend == "torchao_int8_dynamic_activation_int8_weight":
+        from torchao import quantization as torchao_quantization  # type: ignore
+
+        quantize_fn = getattr(torchao_quantization, "quantize_")
+        quantizer_fn = getattr(
+            torchao_quantization, "int8_dynamic_activation_int8_weight"
+        )
+        quantize_fn(model, quantizer_fn())
+        return model, {"method": "dynamic_activation_no_calibration"}
+    if backend == "torchao_int8_static_activation_int8_weight":
+        if calibration is None:
+            raise ValueError(
+                "Static INT8 quantization requires calibration metadata. "
+                "Run calibration before quantize_ or load a calibrated checkpoint."
+            )
+        from torchao import quantization as torchao_quantization  # type: ignore
+        from torchao.quantization.granularity import PerRow, PerTensor
+
+        quantize_fn = getattr(torchao_quantization, "quantize_")
+        config_cls = getattr(
+            torchao_quantization, "Int8StaticActivationInt8WeightConfig"
+        )
+        modules = calibration.get("modules", {})
+        quantized_modules = 0
+        for name, module in model.named_modules():
+            if not isinstance(module, nn.Linear) or name not in modules:
+                continue
+            scale_shape = (1,) * int(modules[name].get("ndim", 2))
+            scale = torch.full(
+                scale_shape, float(modules[name]["scale"]), dtype=torch.float32
+            )
+            config = config_cls(
+                act_quant_scale=scale,
+                act_quant_zero_point=None,
+                granularity=(PerTensor(), PerRow()),
+            )
+            quantize_fn(
+                model,
+                config,
+                filter_fn=lambda _module, fqn, target=name: fqn == target,
+            )
+            quantized_modules += 1
+        if quantized_modules == 0:
+            raise RuntimeError(
+                "Static INT8 quantization did not quantize any modules; "
+                "check calibration module names."
+            )
+        metadata = dict(calibration)
+        metadata["quantized_modules"] = quantized_modules
+        return model, metadata
+    if backend == "torchao_int8_weight_only":
+        from torchao import quantization as torchao_quantization  # type: ignore
+
+        quantize_fn = getattr(torchao_quantization, "quantize_")
+        quantizer_fn = getattr(torchao_quantization, "int8_weight_only")
+        quantize_fn(model, quantizer_fn())
+        return model, {"method": "weight_only_no_activation_calibration"}
+    if backend == "pytorch_dynamic_qint8":
+        return (
+            torch.quantization.quantize_dynamic(
+                model, {torch.nn.Linear}, dtype=torch.qint8
+            ),
+            {"method": "pytorch_dynamic_no_calibration"},
+        )
+    raise ValueError(
+        f"Unknown quantize backend: {backend!r}. Use one of "
+        "'torchao_int8_static_activation_int8_weight', "
+        "'torchao_int8_dynamic_activation_int8_weight', "
+        "'torchao_int8_weight_only', or 'pytorch_dynamic_qint8'."
+    )
+
+
+def _make_student_for_checkpoint(
+    cfg: dict, checkpoint_path: Path, requested_device: str
+) -> tuple[nn.Module, str]:
+    backend = _quantize_backend(cfg, checkpoint_path)
+    device = "cpu" if backend else requested_device
+    model = make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"]).to(device)
+    if backend:
+        calibration = _checkpoint_quantization_calibration(checkpoint_path)
+        model, _ = _apply_quantization_backend(model.eval(), backend, calibration)
+        model = model.to(device)
+    model.eval()
+    load_checkpoint(checkpoint_path, model, device)
+    return model, device
+
+
+def _resolve_fp32_student_checkpoint(cfg: dict, checkpoint_path: Path) -> Path:
+    """Return a non-quantized student checkpoint for export to standard ONNX."""
+    if "quantized" not in checkpoint_path.stem:
+        return checkpoint_path
+
+    ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
+    for candidate in (
+        ckpt_dir / "mobilenetv4_distilled.pth",
+        ckpt_dir / "mobilenetv4_finetuned.pth",
+    ):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "ONNX export needs a FP32 student checkpoint. Expected "
+        f"{ckpt_dir / 'mobilenetv4_distilled.pth'} or "
+        f"{ckpt_dir / 'mobilenetv4_finetuned.pth'}."
+    )
+
+
+def _export_calibrated_int8_onnx(
+    cfg: dict,
+    fp32_onnx_path: Path,
+    int8_onnx_path: Path,
+) -> bool:
+    """Create a calibrated QDQ INT8 ONNX model for NPU deployment."""
+    try:
+        ort_quant = __import__(
+            "onnxruntime.quantization",
+            fromlist=[
+                "CalibrationDataReader",
+                "QuantFormat",
+                "QuantType",
+                "quantize_static",
+            ],
+        )
+    except ImportError as exc:
+        print(
+            "INT8 ONNX export skipped: onnxruntime is not installed. "
+            "Install classification/requirements.txt and rerun export."
+        )
+        print(f"  Import error: {exc}")
+        return False
+
+    cal_cfg = cfg.get("quantize", {}).get("calibration", {})
+    cal_batch_size = cal_cfg.get("batch_size", 8)
+    cal_batches = cal_cfg.get("batches", 32)
+    cal_split = cal_cfg.get("split", "val")
+
+    cal_train, cal_val, cal_test, _ = get_dataloaders(
+        data_dir=Path(cfg["data"]["dir"]),
+        image_size=cfg["data"]["image_size"],
+        num_classes=cfg["data"]["num_classes"],
+        batch_size=cal_batch_size,
+        workers=cfg["data"]["workers"],
+        mixup=False,
+    )
+    calibration_loader = {
+        "train": cal_train,
+        "val": cal_val,
+        "test": cal_test,
+    }.get(cal_split)
+    if calibration_loader is None:
+        raise ValueError(
+            f"Unknown quantize.calibration.split={cal_split!r}; "
+            "use 'train', 'val', or 'test'."
+        )
+
+    class ImageCalibrationReader(ort_quant.CalibrationDataReader):
+        def __init__(self):
+            self._iterator = iter(calibration_loader)
+            self._seen = 0
+
+        def get_next(self):
+            if self._seen >= cal_batches:
+                return None
+            try:
+                images, _ = next(self._iterator)
+            except StopIteration:
+                return None
+            self._seen += 1
+            return {"input": images.cpu().numpy()}
+
+    print(
+        f"Calibrating INT8 ONNX on {cal_split} split "
+        f"({cal_batches} batches, batch_size={cal_batch_size})"
+    )
+    ort_quant.quantize_static(
+        model_input=str(fp32_onnx_path),
+        model_output=str(int8_onnx_path),
+        calibration_data_reader=ImageCalibrationReader(),
+        quant_format=ort_quant.QuantFormat.QDQ,
+        activation_type=ort_quant.QuantType.QInt8,
+        weight_type=ort_quant.QuantType.QInt8,
+    )
+    return True
 
 
 def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
@@ -492,8 +870,10 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
     is smaller but forces activations to FP32 (CPU/NPU offload path).
 
     Backends (`cfg["quantize"]["backend"]`):
+      - ``torchao_int8_static_activation_int8_weight``: calibrated full INT8
+        using validation batches for activation scales. (default)
       - ``torchao_int8_dynamic_activation_int8_weight``: full INT8, dynamic
-        activation quant at runtime. (default; no calibration data needed)
+        activation quant at runtime. (no calibration data needed)
       - ``torchao_int8_weight_only``: legacy weight-only INT8
       - ``pytorch_dynamic_qint8``: PyTorch dynamic fallback (no torchao)
 
@@ -502,8 +882,7 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
     """
     device = "cpu"
 
-    # Two copies of the loaded student: one stays FP32 (SNR reference),
-    # the other is quantized in-place.
+    # Two loaded students: one stays FP32 (SNR reference), one is quantized.
     fp32_model = (
         make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"])
         .to(device)
@@ -514,37 +893,72 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
         print(f"Loaded FP32 baseline from {checkpoint_path}")
     else:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model = copy.deepcopy(fp32_model)
+    model = (
+        make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"])
+        .to(device)
+        .eval()
+    )
+    load_checkpoint(checkpoint_path, model, device)
 
     original_mb = _size_mb(checkpoint_path)
     ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
     out_path = ckpt_dir / "mobilenetv4_quantized.pth"
 
-    backend = cfg.get("quantize", {}).get(
-        "backend", "torchao_int8_dynamic_activation_int8_weight"
-    )
+    backend = cfg.get("quantize", {}).get("backend", DEFAULT_QUANTIZE_BACKEND)
+
+    calibration = None
+    if backend == "torchao_int8_static_activation_int8_weight":
+        cal_cfg = cfg.get("quantize", {}).get("calibration", {})
+        cal_batch_size = cal_cfg.get("batch_size", cfg.get("quantize", {}).get("snr", {}).get("batch_size", 8))
+        cal_batches = cal_cfg.get("batches", 32)
+        cal_split = cal_cfg.get("split", "val")
+        cal_train, cal_val, cal_test, _ = get_dataloaders(
+            data_dir=Path(cfg["data"]["dir"]),
+            image_size=cfg["data"]["image_size"],
+            num_classes=cfg["data"]["num_classes"],
+            batch_size=cal_batch_size,
+            workers=cfg["data"]["workers"],
+            mixup=False,
+        )
+        calibration_loader = {
+            "train": cal_train,
+            "val": cal_val,
+            "test": cal_test,
+        }.get(cal_split)
+        if calibration_loader is None:
+            raise ValueError(
+                f"Unknown quantize.calibration.split={cal_split!r}; "
+                "use 'train', 'val', or 'test'."
+            )
+        print(
+            f"Calibrating static INT8 activations on {cal_split} split "
+            f"({cal_batches} batches, batch_size={cal_batch_size})"
+        )
+        calibration = _calibrate_linear_activation_ranges(
+            model,
+            calibration_loader,
+            device,
+            max_batches=cal_batches,
+            mixed_precision=False,
+        )
+        print(
+            "  Calibrated linear modules: "
+            f"{len(calibration.get('modules', {}))}; "
+            f"observed_batches={calibration['batches']}"
+        )
 
     backend_used = backend
     try:
-        if backend == "torchao_int8_dynamic_activation_int8_weight":
-            from torchao.quantization import (
-                int8_dynamic_activation_int8_weight,  # type: ignore
-                quantize_,
-            )
-
-            quantize_(model, int8_dynamic_activation_int8_weight())
-        elif backend == "torchao_int8_weight_only":
-            from torchao.quantization import int8_weight_only, quantize_  # type: ignore
-
-            quantize_(model, int8_weight_only())
-        else:
-            raise ValueError(
-                f"Unknown quantize backend: {backend!r}. Use one of "
-                "'torchao_int8_dynamic_activation_int8_weight', "
-                "'torchao_int8_weight_only'."
-            )
-
-        save_checkpoint(model, out_path)
+        model, quantization_metadata = _apply_quantization_backend(
+            model, backend, calibration
+        )
+        save_checkpoint(
+            model,
+            out_path,
+            quantized=True,
+            backend=backend_used,
+            calibration=quantization_metadata,
+        )
         quantized_mb = _size_mb(out_path)
         saved_mb = original_mb - quantized_mb
         saved_pct = (saved_mb / original_mb * 100) if original_mb else 0.0
@@ -556,7 +970,7 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
 
         # --- Quantization SNR scoring ---
         snr_cfg = cfg.get("quantize", {}).get("snr", {})
-        _, val_snr, _ = get_dataloaders(
+        _, val_snr, _, _ = get_dataloaders(
             data_dir=Path(cfg["data"]["dir"]),
             image_size=cfg["data"]["image_size"],
             num_classes=cfg["data"]["num_classes"],
@@ -592,14 +1006,25 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
                 "saved_pct": saved_pct,
                 "snr_db_logit": snr_logit,
                 "snr_db_softmax": snr["snr_db_softmax"],
+                "calibration_batches": float(
+                    calibration.get("batches", 0) if calibration else 0
+                ),
+                "calibrated_modules": float(
+                    len(calibration.get("modules", {})) if calibration else 0
+                ),
             }
         )
     except ImportError as e:
         print(f"torchao unavailable ({e}); falling back to PyTorch dynamic INT8")
-        model = torch.quantization.quantize_dynamic(
-            model, {torch.nn.Linear}, dtype=torch.qint8
+        backend_used = "pytorch_dynamic_qint8"
+        model, quantization_metadata = _apply_quantization_backend(model, backend_used)
+        save_checkpoint(
+            model,
+            out_path,
+            quantized=True,
+            backend=backend_used,
+            calibration=quantization_metadata,
         )
-        save_checkpoint(model, out_path)
         print(f"Dynamically quantized model saved to {out_path}")
         log_params({"quantization": "pytorch_dynamic_qint8"})
         log_metrics(
@@ -610,23 +1035,27 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
         )
 
     log_artifact(out_path)
+    sync_runtime_outputs(cfg, "checkpoint_dir")
     return out_path
 
 
-def run_benchmark(cfg: dict, checkpoint_path: Path) -> dict:
-    """Benchmark a checkpoint. Returns dict of metrics."""
+def run_benchmark(
+    cfg: dict, checkpoint_path: Path, *, class_names: Optional[list] = None
+) -> dict:
+    """Benchmark a checkpoint. Returns dict of metrics.
+
+    Also generates confusion matrix and confidence-analysis plots when
+    ``class_names`` is provided.
+    """
     device = get_device(cfg.get("device", "auto"))
     mp = cfg["data"].get("mixed_precision", False)
-    model = (
-        make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"])
-        .to(device)
-        .eval()
-    )
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    if checkpoint_path.exists():
-        load_checkpoint(checkpoint_path, model, device)
+    model, device = _make_student_for_checkpoint(cfg, checkpoint_path, device)
+    mp = mp and device != "cpu"
 
-    _, _, test_loader = get_dataloaders(
+    _, _, test_loader, _ = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
         image_size=cfg["data"]["image_size"],
         num_classes=cfg["data"]["num_classes"],
@@ -654,26 +1083,129 @@ def run_benchmark(cfg: dict, checkpoint_path: Path) -> dict:
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
+    # --- Confusion matrix + confidence analysis ---
+    if class_names is not None:
+        ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
+        tag = checkpoint_path.stem  # e.g. mobilenetv4_quantized
+        print(f"\n  Generating evaluation reports for {tag}...")
+        _, _, y_true, y_pred, probs = evaluate_with_predictions(
+            model, test_loader, crit, device, mixed_precision=mp
+        )
+        plot_confusion_matrix(
+            y_true,
+            y_pred,
+            class_names,
+            ckpt_dir / f"{tag}_confusion_matrix.png",
+            normalize="true",
+        )
+        plot_confidence_analysis(
+            y_true,
+            y_pred,
+            probs,
+            class_names,
+            ckpt_dir / f"{tag}_confidence_analysis.png",
+        )
+        sync_runtime_outputs(cfg, "checkpoint_dir")
+
     log_metrics(metrics)
     log_params({"benchmark.device": device, "benchmark.runs": 100})
     return metrics
 
 
+def run_full_benchmark_comparison(cfg: dict, class_names: list[str]) -> list[dict]:
+    """Evaluate all available checkpoints and produce a comparison report.
+
+    Loads teacher, student-finetuned, student-distilled, and
+    student-quantized checkpoints (whichever exist), evaluates each on the
+    test set, and returns a list of result dicts suitable for
+    ``plot_benchmark_comparison`` and ``print_benchmark_table``.
+
+    Also generates ``benchmark_comparison.png`` and
+    ``benchmark_comparison.txt`` in the checkpoint directory.
+    """
+    device = get_device(cfg.get("device", "auto"))
+    mp = cfg["data"].get("mixed_precision", False)
+    ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
+    img_size = cfg["data"]["image_size"]
+
+    _, _, test_loader, _ = get_dataloaders(
+        data_dir=Path(cfg["data"]["dir"]),
+        image_size=img_size,
+        num_classes=cfg["data"]["num_classes"],
+        batch_size=cfg["benchmark"]["batch_size"],
+        workers=cfg["data"]["workers"],
+        mixup=False,
+    )
+    crit = nn.CrossEntropyLoss()
+
+    print(f"  Report class order: {class_names}")
+    entries: list[tuple[str, Path, str]] = [
+        (
+            "Teacher (EfficientNet-B3)",
+            ckpt_dir / "teacher_for_distill.pth",
+            "teacher",
+        ),
+        ("Student Fine-tuned", ckpt_dir / "mobilenetv4_finetuned.pth", "student"),
+        ("Student Distilled", ckpt_dir / "mobilenetv4_distilled.pth", "student"),
+        ("Student Quantized", ckpt_dir / "mobilenetv4_quantized.pth", "student"),
+    ]
+
+    results: list[dict] = []
+    for name, path, kind in entries:
+        if not path.exists():
+            print(f"  [SKIP] {name}: checkpoint not found at {path}")
+            continue
+        print(f"\n  Benchmarking {name}...")
+        eval_device = device
+        eval_mp = mp
+        if kind == "teacher":
+            model = make_teacher(cfg["data"]["num_classes"]).to(device).eval()
+            load_checkpoint(path, model, device)
+        else:
+            model, eval_device = _make_student_for_checkpoint(cfg, path, device)
+            eval_mp = mp and eval_device != "cpu"
+        test_loss, test_acc = evaluate(
+            model, test_loader, crit, eval_device, mixed_precision=eval_mp
+        )
+        flops = count_flops(model, input_size=(1, 3, img_size, img_size))
+        size = model_size_mb(path)
+        params = count_params(model)
+        result = {
+            "name": name,
+            "params_m": params / 1e6,
+            "test_acc": test_acc,
+            "size_mb": size,
+            "gflops": flops,
+            "test_loss": test_loss,
+        }
+        results.append(result)
+        print(
+            f"    acc={test_acc:.4f}  loss={test_loss:.4f}  "
+            f"params={params:,}  size={size:.2f}MB  gflops={flops:.3f}"
+        )
+
+    if results:
+        print_benchmark_table(results)
+        plot_benchmark_comparison(results, ckpt_dir / "benchmark_comparison.png")
+        summary_path = ckpt_dir / "benchmark_comparison.json"
+        with open(summary_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"  Comparison summary saved: {summary_path}")
+        sync_runtime_outputs(cfg, "checkpoint_dir")
+    else:
+        print("  [WARN] No checkpoints found for benchmark comparison.")
+
+    return results
+
+
 def run_export(cfg: dict, checkpoint_path: Path) -> dict:
     """Export to TorchScript (.pt) and torch.export (.pt2). Returns dict of paths."""
     device = "cpu"
-    model = (
-        make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"])
-        .to(device)
-        .eval()
-    )
-
-    if checkpoint_path.exists():
-        load_checkpoint(checkpoint_path, model, device)
-        print(f"Loaded checkpoint from {checkpoint_path}")
-        print(f"  Source checkpoint size: {_size_mb(checkpoint_path):.2f} MB")
-    else:
+    if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    model, _ = _make_student_for_checkpoint(cfg, checkpoint_path, device)
+    print(f"Loaded checkpoint from {checkpoint_path}")
+    print(f"  Source checkpoint size: {_size_mb(checkpoint_path):.2f} MB")
 
     export_dir = Path(cfg["paths"]["export_dir"])
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -708,22 +1240,42 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
     # ONNX (for Snapdragon AR1 QNN compilation path)
     if cfg.get("export", {}).get("onnx", True):
         try:
+            onnx_checkpoint = _resolve_fp32_student_checkpoint(cfg, checkpoint_path)
+            onnx_model = (
+                make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"])
+                .to(device)
+                .eval()
+            )
+            load_checkpoint(onnx_checkpoint, onnx_model, device)
             onnx_path = export_dir / "mobilenetv4.onnx"
-            # Let ONNX auto-name the output (avoids a warning when the
-            # source model `forward()` has no `-> str` annotation, which is
-            # the case for vanilla timm CNNs). Batch axis is still dynamic.
             torch.onnx.export(
-                model=model,
+                model=onnx_model,
                 args=(dummy,),
                 f=str(onnx_path),
                 opset_version=cfg.get("export", {}).get("opset", 17),
                 input_names=["input"],
-                dynamic_axes={"input": {0: "batch"}},
+                output_names=["logits"],
+                dynamic_axes={
+                    "input": {0: "batch"},
+                    "logits": {0: "batch"},
+                },
             )
             print(f"ONNX -> {onnx_path}")
+            print(f"  ONNX source checkpoint: {onnx_checkpoint}")
             print(f"  ONNX size: {_size_mb(onnx_path):.2f} MB")
             results["onnx"] = str(onnx_path)
+            results["onnx_source_checkpoint"] = str(onnx_checkpoint)
             log_artifact(onnx_path)
+
+            if cfg.get("export", {}).get("int8_onnx", True):
+                int8_onnx_path = export_dir / "mobilenetv4_int8.onnx"
+                if _export_calibrated_int8_onnx(cfg, onnx_path, int8_onnx_path):
+                    print(f"INT8 ONNX -> {int8_onnx_path}")
+                    print(f"  INT8 ONNX size: {_size_mb(int8_onnx_path):.2f} MB")
+                    results["int8_onnx"] = str(int8_onnx_path)
+                    results["deployment_onnx"] = str(int8_onnx_path)
+                    results["deployment_precision"] = "int8_qdq"
+                    log_artifact(int8_onnx_path)
         except Exception as e:
             print(f"ONNX export failed: {e}")
 
@@ -733,4 +1285,5 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
             "export.arch": cfg["finetune"]["arch"],
         }
     )
+    sync_runtime_outputs(cfg, "export_dir")
     return results

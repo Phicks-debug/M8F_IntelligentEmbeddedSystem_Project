@@ -1,108 +1,139 @@
-# Classification
+# Classification Pipeline
 
-End-to-end classifier for the 8-class mushroom dataset. Trains a large EfficientNet-B3 **teacher**, transfers the knowledge to a small MobileNetV4 **student**, then quantizes and exports the student for edge deployment.
+Training pipeline for the Ray-Ban classification model. It trains a teacher, fine-tunes a MobileNetV4 student, distills, calibrates INT8 quantization, benchmarks, reports, and exports deployment artifacts.
 
-The pipeline is wired with **Metaflow** (orchestration + retry), **Hydra/OmegaConf** (configs), and **MLflow** (experiment tracking).
+## Data Format
 
-## Layout
+Use an ImageFolder layout:
 
 ```text
-classification/
-├── configs/           # Hydra YAML configs (config, stage.*, model.*)
-├── src/
-│   ├── core.py        # Models, transforms, dataloaders, training loop
-│   ├── pipeline.py    # Stage runners: teacher / finetune / distill / quantize / benchmark / export
-│   ├── tracking.py    # MLflow helpers
-│   ├── utils.py       # Device + checkpoint utilities
-│   └── main.py        # Metaflow FlowSpec entrypoint
-├── requirements.txt
-└── Dockerfile
+data/processed/classification_data/
+  train/<class_name>/*.jpg
+  val/<class_name>/*.jpg
+  test/<class_name>/*.jpg
 ```
 
-## Requirements
+Set the path and class count in `classification/configs/config.yaml`:
 
-Runtime deps (`requirements.txt`):
+```yaml
+data:
+  dir: data/processed/classification_data
+  num_classes: 8
+```
 
-| Package | Purpose |
-| --- | --- |
-| `torch>=2.0`, `torchvision>=0.15` | CUDA/MPS training & v2 transforms |
-| `timm>=1.0` | MobileNetV4 student with pretrained weights |
-| `metaflow>=2.12` | Pipeline orchestration (steps, retry, resources) |
-| `hydra-core>=1.3`, `omegaconf>=2.3` | Layered YAML configuration |
-| `mlflow>=2.14` | Experiment tracking + artifact logging |
-| `torchao>=0.3` | INT8 weight-only quantization (preferred) |
-| `tqdm`, `numpy` | Logging, math |
+## Setup
 
-Optional but recommended: `fvcore` (FLOPs benchmark), `executorch` (edge export).
-
-## Quick Start
-
-1. **Preprocess data** with `data-preprocessing-classification.ipynb` at the project root. It copies images into `data/processed/classification_data/{train,val,test}/<species>/*.jpg` and writes the aligned `metadata.csv`.
-2. **Install deps**:
-
-   ```bash
-   pip install -r classification/requirements.txt
-   ```
-
-3. **Run the full pipeline** locally:
-
-   ```bash
-   python classification/src/main.py run
-   ```
-
-4. **Smoke test** (1 epoch per stage):
-
-   ```bash
-   python classification/src/main.py run --quick-test
-   ```
-
-## Usage
-
-Run a single stage instead of the full chain:
+Use the project `.venv` with `uv`:
 
 ```bash
-python classification/src/main.py run --stage finetune
-python classification/src/main.py run --stage distill
-python classification/src/main.py run --stage quantize
-python classification/src/main.py run --stage benchmark
-python classification/src/main.py run --stage export
+uv pip install -r classification/requirements.txt
 ```
 
-Available stages: `all`, `teacher`, `finetune`, `distill`, `quantize`, `benchmark`, `export`.
+Run from the repository root.
 
-Metaflow compute backends (any of these works):
+## Local Run
+
+Full pipeline:
 
 ```bash
-python classification/src/main.py run --with kubernetes
-python classification/src/main.py run --with argo
-python classification/src/main.py run --with batch   # AWS Batch
+.venv/bin/python classification/src/main.py run
 ```
 
-## Configuration
-
-All training knobs are under `configs/` and composed by Hydra at runtime:
-
-- `configs/config.yaml` — defaults (data, finetune, distill, paths, device)
-- `configs/stage/{finetune,distill,quantize}.yaml` — per-stage overrides
-- `configs/model/{efficientnet_b3,mobilenetv4}.yaml` — model definitions
-
-To change defaults, edit `configs/config.yaml` or add a YAML under `configs/stage/` (e.g., copy `stage/finetune.yaml` and override fields — Hydra picks up files in that group automatically).
-
-## Docker
+Smoke test:
 
 ```bash
-docker build -f classification/Dockerfile -t mushroom-cls .
-docker run --rm -v $(pwd)/data:/workspace/data mushroom-cls          # full pipeline
-docker run --rm -e STAGE=finetune mushroom-cls                       # one stage
+.venv/bin/python classification/src/main.py run --quick-test
 ```
 
-The container runs as a non-root user and is set up for `@resources(cpu=4, memory=…, gpu=1)` Metaflow steps.
+Single stage:
+
+```bash
+.venv/bin/python classification/src/main.py run --stage finetune
+.venv/bin/python classification/src/main.py run --stage distill
+.venv/bin/python classification/src/main.py run --stage quantize
+.venv/bin/python classification/src/main.py run --stage benchmark
+.venv/bin/python classification/src/main.py run --stage report
+.venv/bin/python classification/src/main.py run --stage export
+```
+
+Stages: `all`, `teacher`, `finetune`, `distill`, `quantize`, `benchmark`, `report`, `export`.
+
+## Cloud GPU Run
+
+Metaflow can run the same flow on a remote backend:
+
+```bash
+.venv/bin/python classification/src/main.py run --with batch
+.venv/bin/python classification/src/main.py run --with kubernetes
+.venv/bin/python classification/src/main.py run --with argo
+```
+
+The GPU steps already request GPU resources in `src/main.py`.
+
+## Local, S3, or R2 Storage
+
+`data.dir`, `paths.checkpoint_dir`, and `paths.export_dir` can be local paths or object-store URIs. Remote data is staged to `paths.local_cache_dir`; outputs are synced back after stages.
+
+S3 example:
+
+```yaml
+data:
+  dir: s3://my-bucket/rayban/classification_data
+
+paths:
+  checkpoint_dir: s3://my-bucket/rayban/checkpoints
+  export_dir: s3://my-bucket/rayban/exported_models
+  local_cache_dir: .cache/classification
+```
+
+Cloudflare R2 example:
+
+```yaml
+data:
+  dir: r2://my-bucket/rayban/classification_data
+
+paths:
+  checkpoint_dir: r2://my-bucket/rayban/checkpoints
+  export_dir: r2://my-bucket/rayban/exported_models
+  storage_options:
+    client_kwargs:
+      endpoint_url: https://<account-id>.r2.cloudflarestorage.com
+```
+
+Use normal S3/R2 credentials in the environment.
 
 ## Outputs
 
-| Path | Content |
-| --- | --- |
-| `checkpoints/*.pth` | Trained teacher / student / distilled / quantized weights |
-| `exported_models/*.pt`, `*.pt2` | TorchScript & `torch.export` artifacts |
-| `mlflow.db` | Local SQLite tracking backend |
-| `pipeline_summary.json` | Final metrics + export paths |
+```text
+checkpoints/
+  teacher_for_distill.pth
+  mobilenetv4_finetuned.pth
+  mobilenetv4_distilled.pth
+  mobilenetv4_quantized.pth
+  *_history.json
+  *_training_curves.png
+  *_confusion_matrix.png
+  *_confidence_analysis.png
+  benchmark_comparison.json
+  benchmark_comparison.png
+
+exported_models/
+  mobilenetv4.pt
+  mobilenetv4.pt2
+  mobilenetv4.onnx
+  mobilenetv4_int8.onnx
+```
+
+Use `exported_models/mobilenetv4_int8.onnx` as the Ray-Ban NPU deployment model. It is a calibrated QDQ INT8 ONNX model. `mobilenetv4.onnx` is only the FP32 intermediate used to build the INT8 export.
+
+The `quantize` stage also saves a calibrated PyTorch INT8 checkpoint at `checkpoints/mobilenetv4_quantized.pth`.
+
+Reruns use fixed output filenames. Training checkpoints update when a new best validation score is saved; quantize and export outputs overwrite their previous files.
+
+## Checks
+
+```bash
+.venv/bin/python -m ruff check classification/src
+uvx pyright --pythonpath .venv/bin/python
+.venv/bin/python classification/src/main.py check
+```

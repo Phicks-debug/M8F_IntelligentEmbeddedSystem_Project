@@ -238,4 +238,5 @@ exported_models/
 
 # MLflow
 .metaflow
-mlflow.db
+mlflow.db*
+mlruns

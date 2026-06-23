@@ -1,4 +1,6 @@
 import os
+import random
+import shutil
 
 root = r"C:\Users\jules\Documents\prog\M8F_IntelligentEmbeddedSystem_Project\detection\data\raw"
 
@@ -49,9 +51,6 @@ os.makedirs(os.path.join(root, "test", "mushroom"), exist_ok=True)
 print("division")
 
 # Split the datasets into train, validation, and test sets
-import random
-import shutil
-
 random.seed(42)
 
 for dataset_path, image_list in dataset_lists.items():

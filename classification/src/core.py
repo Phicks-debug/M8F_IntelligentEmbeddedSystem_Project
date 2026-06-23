@@ -2,8 +2,6 @@
 Core utilities: data loading, model creation, metrics, and training primitives.
 """
 
-from __future__ import annotations
-
 import os
 import random
 import time
@@ -156,9 +154,29 @@ def try_load_resume_state(
         return None
 
 
-def build_transforms(image_size: int, is_train: bool) -> v2.Compose:
-    """Build train or eval transforms."""
+def build_transforms(image_size: int, is_train: bool, light: bool = False) -> v2.Compose:
+    """Build train or eval transforms.
+
+    Args:
+        image_size: target spatial resolution.
+        is_train: whether to apply training augmentation.
+        light: if ``True`` and ``is_train=True``, use a milder augmentation
+            pipeline (no RandAugment, smaller rotation, larger crop scale).
+            Recommended for small student models where strong augmentation
+            causes unstable training.
+    """
     if is_train:
+        if light:
+            return v2.Compose(
+                [
+                    v2.ToImage(),
+                    v2.RandomResizedCrop(image_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+                    v2.RandomHorizontalFlip(p=0.5),
+                    v2.RandomRotation(degrees=(-8.0, 8.0), fill=128),
+                    v2.ToDtype(torch.float32, scale=True),
+                    v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                ]
+            )
         return v2.Compose(
             [
                 v2.ToImage(),
@@ -198,12 +216,19 @@ def get_dataloaders(
     batch_size: int,
     workers: int = 0,
     mixup: bool = False,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    light_augmentation: bool = False,
+) -> Tuple[DataLoader, DataLoader, DataLoader, dict]:
+    """Return train, val, test DataLoaders and class counts.
+
+    Expected structure: ``data_dir/{train,val,test}/class_name/*.jpg``.
+
+    Args:
+        light_augmentation: use milder augmentation for the training split.
+
+    Returns:
+        (train_loader, val_loader, test_loader, class_counts)
     """
-    Returns train, val, test DataLoaders for ImageFolder dataset.
-    Expected structure: data_dir/{train,val,test}/class_name/*.jpg
-    """
-    train_tf = build_transforms(image_size, is_train=True)
+    train_tf = build_transforms(image_size, is_train=True, light=light_augmentation)
     eval_tf = build_transforms(image_size, is_train=False)
 
     train_ds = datasets.ImageFolder(data_dir / "train", train_tf)
@@ -214,11 +239,22 @@ def get_dataloaders(
         f"num_classes={num_classes} != ImageFolder classes={len(train_ds.classes)}. "
         "Re-run data preprocessing."
     )
+    if val_ds.classes != train_ds.classes or test_ds.classes != train_ds.classes:
+        raise ValueError(
+            "Train/val/test class folders do not match. "
+            f"train={train_ds.classes}, val={val_ds.classes}, test={test_ds.classes}"
+        )
 
-    # Bias check: warn if class counts are skewed (max/min ratio > warn_ratio).
-    assert_class_balance(train_ds, warn_ratio=2.0)
+    class_counts = assert_class_balance(train_ds, warn_ratio=2.0)
 
-    kwargs: dict = dict(batch_size=batch_size, num_workers=workers, pin_memory=False)
+    kwargs: dict = {
+        "batch_size": batch_size,
+        "num_workers": workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
 
     train = DataLoader(
         train_ds,
@@ -231,23 +267,19 @@ def get_dataloaders(
     val = DataLoader(val_ds, shuffle=False, **kwargs)
     test = DataLoader(test_ds, shuffle=False, **kwargs)
 
-    return train, val, test
+    return train, val, test, class_counts
 
 
 def assert_class_balance(ds, warn_ratio: float = 2.0) -> dict:
-    """Print per-class counts from a dataset and warn if imbalance exceeds ratio.
-
-    Helps catch dataset skew **before** training starts (which can bias a
-    classifier toward majority classes). Returns ``dict[label -> count]``.
+    """Print per-class counts and warn if imbalance exceeds ratio.
 
     Args:
-        ds: any object exposing a list-like ``.targets`` attribute (this
-            matches torchvision's ``ImageFolder`` / ``Subset``). Falls back
-            to enumerating ``ds[i][1]`` otherwise.
-        warn_ratio: emit a WARN line when ``max_count / min_count > warn_ratio``.
+        ds: any object exposing a ``.targets`` attribute, or indexable
+            as ``ds[i][1]``.
+        warn_ratio: threshold for the imbalance warning.
 
     Returns:
-        ``{label: count}`` mapping the same labels returned by ``ds[i][1]``.
+        ``{label: count}`` mapping.
     """
     from collections import Counter
 
@@ -273,6 +305,22 @@ def assert_class_balance(ds, warn_ratio: float = 2.0) -> dict:
                 "class-weighted CrossEntropyLoss."
             )
     return dict(counts)
+
+
+def class_weights_from_counts(counts: dict, device: str) -> torch.Tensor:
+    """Return inverse-frequency class weights suitable for CrossEntropyLoss.
+
+    The returned tensor is normalized so that the mean weight is 1.0.
+    This keeps the loss scale comparable to unweighted training.
+    """
+    total = sum(counts.values())
+    n_classes = len(counts)
+    weights = torch.tensor(
+        [total / max(counts.get(c, 1), 1) for c in range(n_classes)],
+        dtype=torch.float32,
+        device=device,
+    )
+    return weights / weights.mean()
 
 
 def make_student(arch: str, num_classes: int, pretrained: bool = True) -> nn.Module:
@@ -435,7 +483,8 @@ def count_flops(model: nn.Module, input_size: tuple = (1, 3, 224, 224)) -> float
     try:
         from fvcore.nn import FlopCountAnalysis
 
-        dummy = torch.randn(*input_size)
+        device = next(model.parameters()).device
+        dummy = torch.randn(*input_size, device=device)
         flops = FlopCountAnalysis(model, dummy)
         return flops.total() / 1e9  # GFLOPs
     except ImportError:

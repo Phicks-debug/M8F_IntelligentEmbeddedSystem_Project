@@ -11,6 +11,8 @@
     "detection", "**/node_modules", "**/.*"
   ],
   "pythonVersion": "3.12",
+  "venvPath": ".",
+  "venv": ".venv",
   "typeCheckingMode": "basic",
   "reportMissingTypeStubs": "none",
   "reportUnknownMemberType": "none",

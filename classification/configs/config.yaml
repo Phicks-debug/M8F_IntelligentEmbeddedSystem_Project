@@ -18,6 +18,10 @@ finetune:
   weight_decay: 1.0e-4
   warmup: 2
   smoothing: 0.0
+  # Student-specific overrides (teacher uses the values above).
+  student_lr: 5.0e-5
+  light_augmentation: true
+  student_patience: 15
 
 distill:
   teacher: efficientnet_b3
@@ -33,23 +37,36 @@ distill:
 quantize:
   # Full INT8 (weights + activations) — required for the Hexagon NPU on
   # Meta Ray-Ban's Snapdragon AR1 Gen 1. See PIPELINE.md section 4.
-  backend: torchao_int8_dynamic_activation_int8_weight
+  # Static INT8 is calibrated on validation batches before quantize_.
+  backend: torchao_int8_static_activation_int8_weight
+  calibration:
+    split: val
+    batch_size: 8
+    batches: 32
   snr:
     batch_size: 8
     batches: 16  # cap on calibration batches for SNR (dB) scoring
 
 export:
-  onnx: true # ONNX is the input the Qualcomm QNN compiler expects
+  onnx: true # FP32 intermediate ONNX
+  int8_onnx: true # final Ray-Ban NPU deployment ONNX (QDQ INT8)
   opset: 17
 
 benchmark:
   batch_size: 64  # inference-only (no backward, no optimizer state), so 64 is safe and amortizes launch overhead
 
 paths:
+  # data.dir, checkpoint_dir, and export_dir can be local paths or object-store
+  # URIs. S3 works as s3://bucket/prefix. Cloudflare R2 can use r2://bucket/prefix
+  # with storage_options.client_kwargs.endpoint_url, or s3:// with AWS_ENDPOINT_URL.
   checkpoint_dir: checkpoints
   export_dir: exported_models
+  local_cache_dir: .cache/classification
   mlflow_tracking_uri: sqlite:///mlflow.db
+  # storage_options:
+  #   client_kwargs:
+  #     endpoint_url: https://<account-id>.r2.cloudflarestorage.com
 
 device: mps
-seed: 42
+seed: 67
 patience: 10

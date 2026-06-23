@@ -35,7 +35,7 @@ class TrainingFlow(FlowSpec):
 
     stage = Parameter(
         "stage",
-        help="Pipeline stage to run (all, teacher, finetune, distill, quantize, benchmark, export)",
+        help="Pipeline stage to run (all, teacher, finetune, distill, quantize, benchmark, report, export)",
         default="all",
     )
     config_name = Parameter(
@@ -54,6 +54,7 @@ class TrainingFlow(FlowSpec):
         """Initialize Hydra config and validate data."""
         import hydra
         from omegaconf import OmegaConf
+        from src.utils import prepare_runtime_paths
 
         with hydra.initialize_config_dir(
             config_dir=str(CLASSIFICATION_ROOT / "configs"), version_base=None
@@ -61,6 +62,7 @@ class TrainingFlow(FlowSpec):
             cfg = hydra.compose(config_name=str(self.config_name))
 
         self.cfg = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
+        prepare_runtime_paths(self.cfg)
 
         if self.quick_test:
             self.cfg["finetune"]["epochs"] = 1
@@ -68,7 +70,7 @@ class TrainingFlow(FlowSpec):
             print("*** QUICK TEST MODE (1 epoch per stage) ***")
 
         print("Configuration:")
-        print(OmegaConf.to_yaml(cfg))
+        print(OmegaConf.to_yaml(OmegaConf.create(self.cfg)))
 
         data_dir = Path(self.cfg["data"]["dir"])
         for split in ("train", "val", "test"):
@@ -84,7 +86,7 @@ class TrainingFlow(FlowSpec):
         """Validate dataset paths, class count, and split sizes."""
         from src.core import get_dataloaders
 
-        train, val, test = get_dataloaders(
+        train, val, test, _ = get_dataloaders(
             data_dir=Path(self.cfg["data"]["dir"]),
             image_size=self.cfg["data"]["image_size"],
             num_classes=self.cfg["data"]["num_classes"],
@@ -97,10 +99,11 @@ class TrainingFlow(FlowSpec):
         train_folder = cast(ImageFolder, train.dataset)
         val_ds = cast(Sized, val.dataset)
         test_ds = cast(Sized, test.dataset)
+        self.class_names = train_folder.classes
         print(
             f"Dataset sizes: train={len(train_folder)}, val={len(val_ds)}, test={len(test_ds)}"
         )
-        print(f"Classes: {train_folder.classes}")
+        print(f"Classes: {self.class_names}")
         self.next(self.train_teacher)
 
     @resources(cpu=4, memory=24000, gpu=1)
@@ -218,7 +221,7 @@ class TrainingFlow(FlowSpec):
         if self.stage not in ("all", "benchmark"):
             print(f"Skipping benchmark (stage={self.stage})")
             self.metrics = {}
-            self.next(self.export)
+            self.next(self.report)
             return
 
         ckpt = Path(self.cfg["paths"]["checkpoint_dir"]) / "mobilenetv4_quantized.pth"
@@ -238,13 +241,42 @@ class TrainingFlow(FlowSpec):
         from src.pipeline import run_benchmark
         from src.tracking import start_run
 
+        class_names = getattr(self, "class_names", None)
         tracking_uri = self.cfg.get("paths", {}).get("mlflow_tracking_uri")
         with start_run(
             "mushroom_classification", run_name="benchmark", tracking_uri=tracking_uri
         ):
-            self.metrics = run_benchmark(self.cfg, ckpt)
+            self.metrics = run_benchmark(self.cfg, ckpt, class_names=class_names)
 
         print(f"Benchmark metrics: {self.metrics}")
+        self.next(self.report)
+
+    @resources(cpu=4, memory=16000)
+    @step
+    def report(self):
+        """Generate multi-model benchmark comparison and final analysis."""
+        if self.stage not in ("all", "benchmark", "report"):
+            print(f"Skipping report (stage={self.stage})")
+            self.next(self.export)
+            return
+
+        class_names = getattr(self, "class_names", None)
+        if class_names is None:
+            print("  [WARN] class_names not available; skipping comparison report.")
+            self.next(self.export)
+            return
+
+        from src.pipeline import run_full_benchmark_comparison
+        from src.tracking import start_run
+
+        tracking_uri = self.cfg.get("paths", {}).get("mlflow_tracking_uri")
+        with start_run(
+            "mushroom_classification", run_name="report", tracking_uri=tracking_uri
+        ):
+            self.comparison_results = run_full_benchmark_comparison(
+                self.cfg, class_names
+            )
+
         self.next(self.export)
 
     @resources(cpu=4, memory=16000)
@@ -273,6 +305,7 @@ class TrainingFlow(FlowSpec):
 
         from src.pipeline import run_export
         from src.tracking import log_model_summary, start_run
+        from src.utils import sync_runtime_outputs
 
         tracking_uri = self.cfg.get("paths", {}).get("mlflow_tracking_uri")
         with start_run(
@@ -291,6 +324,7 @@ class TrainingFlow(FlowSpec):
                 summary,
                 Path(self.cfg["paths"]["checkpoint_dir"]) / "pipeline_summary.json",
             )
+            sync_runtime_outputs(self.cfg, "checkpoint_dir", "export_dir")
 
         print(f"Exported artifacts: {self.exported}")
         self.next(self.end)
