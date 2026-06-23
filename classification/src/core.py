@@ -5,6 +5,7 @@ Core utilities: data loading, model creation, metrics, and training primitives.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Optional, Tuple, cast
 
@@ -17,6 +18,58 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import v2
 from tqdm import tqdm
+
+
+def _amp_ctx(device: str, enabled: bool):
+    """Return `torch.autocast(...)` if FP16 autocast is enabled and the device
+    supports it; otherwise a no-op context. Used to halve activation memory on
+    Apple MPS (PyTorch 2.x) and CUDA when `data.mixed_precision: true`.
+    """
+    if enabled and device in ("mps", "cuda"):
+        return torch.autocast(device_type=device, dtype=torch.float16)
+    return nullcontext()
+
+
+def _live_mem_snapshot(device: str, threshold: float = 0.8) -> Optional[str]:
+    """Return a one-line memory snapshot string. When system RSS exceeds
+    `threshold` (default 80%), the line is prefixed with `[WARN]`.
+
+    Reports:
+      - Process RSS / system total via psutil (always, when psutil is installed).
+      - MPS-allocated pool via `torch.mps.current_allocated_memory()` (MPS only).
+      - CUDA-allocated pool via `torch.cuda.memory_allocated()` (CUDA only).
+
+    On any driver error (e.g. probing MPS before the device is initialized),
+    the device-level fields are silently skipped and the RSS line is still
+    returned. Returns ``None`` if psutil isn't installed.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return None
+    proc = psutil.Process()
+    rss = proc.memory_info().rss
+    total = psutil.virtual_memory().total
+    pct = rss / total
+    line = f"RAM {rss / 1e9:.2f}GB / {total / 1e9:.2f}GB ({pct * 100:.0f}%)"
+    if device == "mps":
+        try:
+            mp = torch.mps.current_allocated_memory()
+            line += f" | MPS allocated {mp / 1e9:.2f}GB"
+        except Exception:
+            pass
+    elif device == "cuda":
+        try:
+            cu = torch.cuda.memory_allocated()
+            line += f" | CUDA allocated {cu / 1e9:.2f}GB"
+        except Exception:
+            pass
+    if pct > threshold:
+        return (
+            f"[WARN] {line} -- above {threshold * 100:.0f}% threshold; "
+            "consider dropping finetune.batch_size / distill.batch_size"
+        )
+    return line
 
 
 def build_transforms(image_size: int, is_train: bool) -> v2.Compose:
@@ -216,6 +269,7 @@ def train_one_epoch(
     device: str,
     teacher: Optional[nn.Module] = None,
     distill_cfg: Optional[Dict] = None,
+    mixed_precision: bool = False,
 ) -> tuple:
     """Train for one epoch. Optionally performs knowledge distillation."""
     model.train()
@@ -227,30 +281,27 @@ def train_one_epoch(
         targets = targets.to(device)
 
         optimizer.zero_grad()
-        outputs = model(images)
-
-        if teacher is not None and distill_cfg is not None:
-            with torch.no_grad():
-                t_logits = teacher(images)
-            loss = distillation_loss(
-                outputs,
-                t_logits,
-                targets,
-                T=distill_cfg["T"],
-                alpha=distill_cfg["alpha"],
-                criterion=criterion,
-            )
-            acc_targets = targets.argmax(dim=1) if targets.ndim == 2 else targets
-            acc_val = accuracy(outputs, acc_targets)
-        else:
-            if isinstance(targets, tuple):
-                loss = criterion(outputs, targets[0])
-                acc_val = accuracy(outputs, targets[0].argmax(dim=1))
-            else:
-                loss = criterion(outputs, targets)
+        with _amp_ctx(device, mixed_precision):
+            outputs = model(images)
+            if teacher is not None and distill_cfg is not None:
+                with torch.no_grad():
+                    t_logits = teacher(images)
+                loss = distillation_loss(
+                    outputs, t_logits, targets,
+                    T=distill_cfg["T"],
+                    alpha=distill_cfg["alpha"],
+                    criterion=criterion,
+                )
                 acc_targets = targets.argmax(dim=1) if targets.ndim == 2 else targets
                 acc_val = accuracy(outputs, acc_targets)
-
+            else:
+                if isinstance(targets, tuple):
+                    loss = criterion(outputs, targets[0])
+                    acc_val = accuracy(outputs, targets[0].argmax(dim=1))
+                else:
+                    loss = criterion(outputs, targets)
+                    acc_targets = targets.argmax(dim=1) if targets.ndim == 2 else targets
+                    acc_val = accuracy(outputs, acc_targets)
         loss.backward()
         optimizer.step()
 
@@ -264,14 +315,21 @@ def train_one_epoch(
 
 
 @torch.inference_mode()
-def evaluate(model: nn.Module, loader: DataLoader, criterion, device: str) -> tuple:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion,
+    device: str,
+    mixed_precision: bool = False,
+) -> tuple:
     """Evaluate model on a dataset."""
     model.eval()
     total_loss, total_acc, n = 0.0, 0.0, 0
     for images, targets in loader:
         images = images.to(device)
         targets = targets.to(device)
-        outputs = model(images)
+        with _amp_ctx(device, mixed_precision):
+            outputs = model(images)
         total_loss += criterion(outputs, targets).item() * images.size(0)
         total_acc += accuracy(outputs, targets)
         n += images.size(0)

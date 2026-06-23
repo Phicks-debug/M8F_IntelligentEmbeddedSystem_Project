@@ -104,13 +104,37 @@ flowchart LR
 
 **SNR target band (logit-level).**
 
-| SNR (dB)      | Verdict              | Action                                  |
-| ------------- | -------------------- | --------------------------------------- |
-| < 20          | WARN                 | Quantization is hurting accuracy — re-tune |
-| 20 → 40       | PASS                 | Acceptable to good — deploy             |
-| ≥ 40          | PASS (excellent)     | No measurable degradation               |
+| SNR (dB) | Verdict | Action |
+| --- | --- | --- |
+| < 20 | WARN | Quantization is hurting accuracy — re-tune |
+| 20 → 40 | PASS | Acceptable to good — deploy |
+| ≥ 40 | PASS (excellent) | No measurable degradation |
 
 > **Note.** SNR is scored on the **val** split (the same split the early-stop / best-checkpoint selector uses). Not a leakage (the model never trains on `val`), but it's slightly optimistic vs. test-set SNR. For an unbiased number before deployment, call `quantization_snr_db()` once more on the **test** loader.
+
+## Live Memory Monitor
+
+`run_finetune` (Phase B) and `run_distill` print a one-line **RAM snapshot** at the end of each epoch, sampled via `psutil`:
+
+```bash
+RAM 4.31GB / 16.00GB (27%) | MPS allocated 3.94GB
+```
+
+When the system's process RSS crosses **80%** of `psutil.virtual_memory().total`, the same line is prefixed with `[WARN]` and a hint to drop `batch_size`:
+
+```bash
+[WARN] RAM 12.87GB / 16.00GB (80%) | MPS allocated 8.91GB -- above 80% threshold; consider dropping finetune.batch_size / distill.batch_size
+```
+
+The snapshot is the cheapest observable that catches OS-level reclaim pressure on **Apple M3 / 16 GB unified-memory** (the most constraining lane) and is intentionally non-fatal — you decide whether to abort, reduce batch size, or wait it out. `psutil>=5.9` is the only new dep.
+
+If you're unsure a full run will fit, start with `--quick-test`:
+
+```bash
+python classification/src/main.py run --quick-test      # 1 epoch per stage
+```
+
+If the WARN never fires over 1-2 epochs, the full run will fit.
 
 **Why this setup.**
 

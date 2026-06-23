@@ -25,6 +25,7 @@ from src.core import (
     quantization_snr_db,
     save_checkpoint,
     train_one_epoch,
+    _live_mem_snapshot,
 )
 from src.tracking import log_artifact, log_metrics, log_params
 from src.utils import get_device
@@ -34,6 +35,7 @@ def run_train_teacher(cfg: dict) -> Path:
     """Fine-tune EfficientNet-B3 teacher. Returns path to best checkpoint."""
     device = get_device(cfg.get("device", "auto"))
     torch.manual_seed(cfg.get("seed", 42))
+    mp = cfg["data"].get("mixed_precision", False)
 
     train_probe, val_probe, _ = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
@@ -85,8 +87,10 @@ def run_train_teacher(cfg: dict) -> Path:
     best_probe = 0.0
     probe_epochs = cfg["finetune"].get("probe_epochs", 5)
     for epoch in range(1, probe_epochs + 1):
-        train_one_epoch(model, train_probe, crit, opt_probe, epoch, device)
-        _, val_acc = evaluate(model, val_probe, eval_crit, device)
+        train_one_epoch(
+            model, train_probe, crit, opt_probe, epoch, device, mixed_precision=mp
+        )
+        _, val_acc = evaluate(model, val_probe, eval_crit, device, mixed_precision=mp)
         print(f"  Probe epoch {epoch}: val_acc={val_acc:.4f}")
         if val_acc > best_probe:
             best_probe = val_acc
@@ -107,10 +111,10 @@ def run_train_teacher(cfg: dict) -> Path:
 
     best_acc, stall = 0.0, 0
     for epoch in range(1, cfg["finetune"]["epochs"] + 1):
-        train_one_epoch(model, train_full, crit, opt, epoch, device)
+        train_one_epoch(model, train_full, crit, opt, epoch, device, mixed_precision=mp)
         if sched is not None:
             sched.step()
-        _, val_acc = evaluate(model, val_full, eval_crit, device)
+        _, val_acc = evaluate(model, val_full, eval_crit, device, mixed_precision=mp)
         print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
         log_metrics({"teacher_val_acc": val_acc}, step=epoch)
 
@@ -126,7 +130,7 @@ def run_train_teacher(cfg: dict) -> Path:
 
     if ckpt_path.exists():
         load_checkpoint(ckpt_path, model, device)
-    _, test_acc = evaluate(model, test_full, eval_crit, device)
+    _, test_acc = evaluate(model, test_full, eval_crit, device, mixed_precision=mp)
     print(f"  Teacher test_acc: {test_acc:.4f}")
     log_metrics({"teacher_test_acc": test_acc, "teacher_best_val_acc": best_acc})
     log_artifact(ckpt_path)
@@ -138,6 +142,7 @@ def run_finetune(cfg: dict) -> Path:
     """Fine-tune MobileNetV4 student. Returns path to best checkpoint."""
     device = get_device(cfg.get("device", "auto"))
     torch.manual_seed(cfg.get("seed", 42))
+    mp = cfg["data"].get("mixed_precision", False)
 
     train_probe, val_probe, _ = get_dataloaders(
         data_dir=Path(cfg["data"]["dir"]),
@@ -189,8 +194,10 @@ def run_finetune(cfg: dict) -> Path:
     best_probe = 0.0
     probe_epochs = cfg["finetune"].get("probe_epochs", 3)
     for epoch in range(1, probe_epochs + 1):
-        train_one_epoch(model, train_probe, crit, opt_probe, epoch, device)
-        _, val_acc = evaluate(model, val_probe, eval_crit, device)
+        train_one_epoch(
+            model, train_probe, crit, opt_probe, epoch, device, mixed_precision=mp
+        )
+        _, val_acc = evaluate(model, val_probe, eval_crit, device, mixed_precision=mp)
         print(f"  Probe epoch {epoch}: val_acc={val_acc:.4f}")
         if val_acc > best_probe:
             best_probe = val_acc
@@ -211,10 +218,13 @@ def run_finetune(cfg: dict) -> Path:
 
     best_acc, stall = 0.0, 0
     for epoch in range(1, cfg["finetune"]["epochs"] + 1):
-        train_one_epoch(model, train_full, crit, opt, epoch, device)
+        train_one_epoch(model, train_full, crit, opt, epoch, device, mixed_precision=mp)
+        snap = _live_mem_snapshot(device)
+        if snap:
+            print(f"  {snap}")
         if sched is not None:
             sched.step()
-        _, val_acc = evaluate(model, val_full, eval_crit, device)
+        _, val_acc = evaluate(model, val_full, eval_crit, device, mixed_precision=mp)
         print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
         log_metrics({"finetune_val_acc": val_acc}, step=epoch)
 
@@ -230,7 +240,7 @@ def run_finetune(cfg: dict) -> Path:
 
     if ckpt_path.exists():
         load_checkpoint(ckpt_path, model, device)
-    _, test_acc = evaluate(model, test_full, eval_crit, device)
+    _, test_acc = evaluate(model, test_full, eval_crit, device, mixed_precision=mp)
     print(f"  Student test_acc: {test_acc:.4f}")
     log_metrics({"finetune_test_acc": test_acc, "finetune_best_val_acc": best_acc})
     log_artifact(ckpt_path)
@@ -242,6 +252,7 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
     """Distill teacher knowledge into student. Returns path to best checkpoint."""
     device = get_device(cfg.get("device", "auto"))
     torch.manual_seed(cfg.get("seed", 42))
+    mp = cfg["data"].get("mixed_precision", False)
 
     teacher = make_teacher(cfg["data"]["num_classes"]).to(device)
     teacher_ckpt_path = Path(cfg["paths"]["checkpoint_dir"]) / "teacher_for_distill.pth"
@@ -308,9 +319,12 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
             teacher=teacher,
             distill_cfg=distill_cfg,
         )
+        snap = _live_mem_snapshot(device)
+        if snap:
+            print(f"  {snap}")
         if sched is not None:
             sched.step()
-        _, val_acc = evaluate(student, val, eval_crit, device)
+        _, val_acc = evaluate(student, val, eval_crit, device, mixed_precision=mp)
         print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
         log_metrics({"distill_val_acc": val_acc}, step=epoch)
 
@@ -326,7 +340,7 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
 
     if ckpt_path.exists():
         load_checkpoint(ckpt_path, student, device)
-    _, test_acc = evaluate(student, test, eval_crit, device)
+    _, test_acc = evaluate(student, test, eval_crit, device, mixed_precision=mp)
     print(f"  Distilled test_acc: {test_acc:.4f}")
     log_metrics({"distill_test_acc": test_acc, "distill_best_val_acc": best_acc})
     log_artifact(ckpt_path)
@@ -471,6 +485,7 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
 def run_benchmark(cfg: dict, checkpoint_path: Path) -> dict:
     """Benchmark a checkpoint. Returns dict of metrics."""
     device = get_device(cfg.get("device", "auto"))
+    mp = cfg["data"].get("mixed_precision", False)
     model = (
         make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"])
         .to(device)
@@ -490,7 +505,7 @@ def run_benchmark(cfg: dict, checkpoint_path: Path) -> dict:
     )
 
     crit = nn.CrossEntropyLoss()
-    test_loss, test_acc = evaluate(model, test_loader, crit, device)
+    test_loss, test_acc = evaluate(model, test_loader, crit, device, mixed_precision=mp)
     img_size = cfg["data"]["image_size"]
     latency = benchmark_latency(model, device, input_size=(1, 3, img_size, img_size))
     flops = count_flops(model, input_size=(1, 3, img_size, img_size))
