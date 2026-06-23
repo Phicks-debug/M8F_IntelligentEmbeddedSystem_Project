@@ -1,0 +1,29 @@
+{
+  "include": ["classification/src", "classification/configs"],
+  "exclude": [
+    ".venv",
+    "__pycache__",
+    ".metaflow",
+    "data",
+    "checkpoints",
+    "exported_models",
+    "mlruns",
+    "detection", "**/node_modules", "**/.*"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUntypedFunctionDecorator": "none",
+  "reportPrivateImportUsage": "none",
+  "reportAttributeAccessIssue": "error",
+  "reportOptionalSubscript": "error",
+  "reportCallIssue": "error",
+  "reportArgumentType": "error",
+  "reportIndexIssue": "error",
+  "strictListInference": false,
+  "strictDictionaryInference": false,
+  "strictParameterNoneValue": false
+}

@@ -1,0 +1,4 @@
+# @package _group_
+arch: mobilenetv4_conv_small.e2400_r224_in1k
+num_classes: 8
+pretrained: true

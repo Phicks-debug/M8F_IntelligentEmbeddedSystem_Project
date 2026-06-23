@@ -235,3 +235,7 @@ metadata/
 runs/
 checkpoints/
 exported_models/
+
+# MLflow
+.metaflow
+mlflow.db

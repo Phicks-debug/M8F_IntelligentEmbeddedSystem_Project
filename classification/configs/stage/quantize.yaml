@@ -1,0 +1,3 @@
+# @package _group_
+# Quantization stage overrides can go here.
+# backend: pytorch_dynamic_qint8

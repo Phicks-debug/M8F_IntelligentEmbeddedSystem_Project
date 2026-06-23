@@ -1,0 +1,41 @@
+data:
+  dir: data/processed/classification_data
+  image_size: 224
+  num_classes: 8
+  workers: 0
+
+finetune:
+  arch: mobilenetv4_conv_small.e2400_r224_in1k
+  batch_size: 64
+  epochs: 50
+  probe_epochs: 3
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup: 2
+  smoothing: 0.0
+
+distill:
+  teacher: efficientnet_b3
+  student: mobilenetv4_conv_small.e2400_r224_in1k
+  batch_size: 64
+  epochs: 30
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  warmup: 3
+  temperature: 6.0
+  alpha: 0.5
+
+quantize:
+  backend: torchao_int8_weight_only
+
+benchmark:
+  batch_size: 64
+
+paths:
+  checkpoint_dir: checkpoints
+  export_dir: exported_models
+  mlflow_tracking_uri: sqlite:///mlflow.db
+
+device: mps
+seed: 42
+patience: 10

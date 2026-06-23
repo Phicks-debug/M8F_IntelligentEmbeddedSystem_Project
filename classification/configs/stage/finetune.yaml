@@ -1,0 +1,4 @@
+# @package _group_
+# Fine-tuning stage overrides can go here.
+# Example: lower LR for quick tests
+# lr: 5.0e-4

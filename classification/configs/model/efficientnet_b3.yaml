@@ -1,0 +1,4 @@
+# @package _group_
+arch: efficientnet_b3
+num_classes: 8
+pretrained: true
