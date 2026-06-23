@@ -2,7 +2,21 @@
 
 Run from the repository root:
     .venv/bin/python classification/predict.py path/to/image.jpg
-"""
+
+    expects a classification model at: M8F_Intelligent.../exported_model/....
+    
+    
+    example output:
+    "image": "data/processed/classification_data/test/Pleurotus_ostreatus/inat_44_0.jpg",
+  "top_prediction": {
+    "class_name": "Pleurotus_ostreatus",
+    "display_name": "Pleurotus ostreatus",
+    "confidence": 0.9999902248382568,
+    "edibility_category": "edible",
+    "edibility_label": "commonly edible",
+    "edibility_note": "Oyster mushroom; widely cultivated and eaten."
+    
+    """
 
 from __future__ import annotations
 

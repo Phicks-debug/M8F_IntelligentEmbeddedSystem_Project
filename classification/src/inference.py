@@ -87,6 +87,46 @@ def predict_image(
     return result
 
 
+def format_prediction(result: dict[str, Any], *, min_candidate_confidence: float = 0.01) -> str:
+    """Return a readable CLI summary with confidence percentages."""
+
+    top = result["top_prediction"]
+    lines = [
+        "Mushroom classification result",
+        "=" * 30,
+        f"Image: {result['image']}",
+        f"Predicted species: {top['display_name']}",
+        f"Confidence: {top['confidence'] * 100:.2f}%",
+        f"Edibility: {top['edibility_label']}",
+        f"Note: {top['edibility_note']}",
+    ]
+
+    other_predictions = result["topk"][1:]
+    visible_others = [
+        pred
+        for pred in other_predictions
+        if pred["confidence"] >= min_candidate_confidence
+    ]
+    hidden_count = len(other_predictions) - len(visible_others)
+
+    if visible_others or hidden_count:
+        lines.extend(["", "Other candidates:"])
+        for pred in visible_others:
+            lines.append(
+                f"- {pred['display_name']}: {pred['confidence'] * 100:.2f}% "
+                f"({pred['edibility_label']})"
+            )
+        if hidden_count:
+            plural = "candidate has" if hidden_count == 1 else "candidates have"
+            lines.append(
+                f"- {hidden_count} other {plural} less than "
+                f"{min_candidate_confidence * 100:.0f}% confidence."
+            )
+
+    lines.extend(["", f"Safety warning: {result['safety_warning']}"])
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Predict mushroom species and edibility.")
     parser.add_argument("image", type=Path, help="Path to an input mushroom image.")
@@ -105,6 +145,11 @@ def main() -> None:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
     parser.add_argument("--topk", type=int, default=3)
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw JSON instead of the human-readable summary.",
+    )
     args = parser.parse_args()
 
     class_names = load_class_names(args.data_dir)
@@ -117,7 +162,10 @@ def main() -> None:
         device=args.device,
         topk=args.topk,
     )
-    print(json.dumps(result, indent=2))
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(format_prediction(result))
 
 
 if __name__ == "__main__":
