@@ -32,4 +32,5 @@ scikit-learn
 # Export (optional)
 onnx>=1.16
 onnxruntime>=1.18
+onnxscript>=0.3
 # executorch

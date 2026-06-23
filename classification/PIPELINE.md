@@ -1,197 +1,127 @@
-# Training Pipeline — Design Notes
+# Pipeline Notes
 
-End-to-end flow:
+This is the current Ray-Ban classification pipeline. Keep this file aligned with `src/main.py`, `src/pipeline.py`, and `configs/config.yaml`.
 
-```mermaid
-flowchart LR
-    data["preprocessed data<br/>data/processed/classification_data"]
-    teacher["train_teacher<br/>EfficientNet-B3"]
-    ft["finetune<br/>MobileNetV4"]
-    distill["distill<br/>KL + CE"]
-    quant["quantize<br/>full INT8 (snr in dB)"]
-    bench["benchmark<br/>acc / latency / GFLOPs / size"]
-    exp["export<br/>TorchScript + torch.export<br/>+ ONNX"]
-
-    data --> teacher
-    teacher -->|teacher_for_distill.pth| ft
-    teacher -.->|frozen, no_grad| distill
-    ft -->|mobilenetv4_finetuned.pth| distill
-    distill -->|mobilenetv4_distilled.pth| quant
-    quant -->|mobilenetv4_quantized.pth| bench
-    bench --> exp
-    exp --> artifacts[("exported_models/<br/>mobilenetv4.pt<br/>mobilenetv4.pt2<br/>mobilenetv4.onnx")]
-```
-
-Six Metaflow `@step`s. Each earlier step's checkpoint feeds the next, checkpoints are logged to MLflow as artifacts, and metrics are logged per-epoch.
-
-## 1. `train_teacher` — Fine-tune EfficientNet-B3
-
-**Purpose.** Train a high-capacity model used only as a teacher.
-
-**Behavior.**
-
-- Two-phase: **probe** (head only, ~3 epochs) then **full** fine-tune (`AdamW`, cosine warmup).
-- ImageNet pretrained weights → swap classifier head → `CrossEntropyLoss(label_smoothing)`.
-- Best val checkpoint saved as `teacher_for_distill.pth`.
-
-**Why this setup.**
-
-- **EfficientNet-B3 over ResNet/ViT:** best accuracy-per-FLOP in the ImageNet family at this size (~12 M params). ResNet-50 is heavier for similar accuracy; ViT-B/16 needs much more data to transfer.
-- **Two-phase probe:** freezes backbone for a few epochs so the new classifier head doesn't get drowned by random gradients; standard warm-up trick for transfer learning.
-- **Cosine + warmup:** smooth LR decay beats step decay for fine-grained tuning; `LinearLR` → `CosineAnnealingLR` via `SequentialLR`.
-
-## 2. `finetune` — Train MobileNetV4 Student (standalone)
-
-**Purpose.** Produce a small, accuracy-reasonable student before distillation.
-
-**Behavior.**
-
-- `mobilenetv4_conv_small.e2400_r224_in1k` from **timm** (≈3 M params).
-- Same two-phase schedule as the teacher.
-- Train augmentations: `RandomResizedCrop(0.7–1.0)`, `HorizontalFlip`, `RandomRotation(±15°)`, `RandAugment(num_ops=2, magnitude=9)`, ImageNet-style `Normalize`.
-- `MixUp` + `CutMix` applied via the dataloader collate (`v2.CutMix → v2.MixUp` chain) on the full-finetune path.
-
-**Why these choices.**
-
-- **MobileNetV4-Conv-Small:** chosen as the edge target — small enough to quantize & export well, recent Google research shows it closes the gap to larger ConvNets.
-- **`timm` over hand-rolled:** weights are correctly named/registered, no surgery to swap the head.
-- **`RandAugment` over hand-picked aug list:** breadth beats hand-tuning on small datasets; magnitude 9 keeps it tame.
-- **MixUp + CutMix stack:** CutMix forces spatial localization, MixUp smooths decision boundaries; chaining both via collate is lightweight compared to a custom `Dataset`.
-
-## 3. `distill` — Knowledge Distillation (KL + CE)
-
-**Purpose.** Compress teacher signal into the student.
-
-Loss composition:
+## Current Flow
 
 ```mermaid
 flowchart LR
-    img[image batch] --> t[teacher forward<br/>frozen]
-    img --> s[student forward]
-    s --> kl["KL(s/T ‖ t/T) · T²"]
-    t --> kl
-    y[hard label] --> ce["CE(s, y)"]
-    s --> ce
-    kl --> loss["α·KL + (1−α)·CE"]
-    ce --> loss
+    data["ImageFolder data<br/>train / val / test"]
+    teacher["teacher<br/>EfficientNet-B3"]
+    student["finetune<br/>MobileNetV4"]
+    distill["distill<br/>teacher -> student"]
+    quant["quantize<br/>calibrated PyTorch INT8"]
+    bench["benchmark<br/>test metrics + diagrams"]
+    export["export<br/>FP32 ONNX -> INT8 QDQ ONNX"]
+    report["report<br/>comparison + markdown"]
+
+    data --> teacher --> student --> distill --> quant --> bench --> export --> report
 ```
 
-**Behavior.**
+Stages:
 
-- Freezes the teacher; student loaded from the finetune checkpoint.
-- Loss: `α · KL(s/T ‖ t/T) · T² + (1−α) · CE(s, y)`, with `T=6.0`, `α=0.5` (config defaults).
-- Same AdamW + cosine schedule.
+- `teacher`: trains `teacher_for_distill.pth`.
+- `finetune`: trains `mobilenetv4_finetuned.pth`.
+- `distill`: trains `mobilenetv4_distilled.pth`.
+- `quantize`: creates `mobilenetv4_quantized.pth` and PyTorch INT8 SNR metrics.
+- `benchmark`: evaluates the quantized PyTorch checkpoint and saves confusion/confidence diagrams.
+- `export`: creates FP32 ONNX, calibrated INT8 QDQ ONNX, and validates ONNX metrics.
+- `report`: writes comparison JSON, benchmark diagram, and `classification_report.md`.
 
-**Why this setup.**
+## Deployment Artifact
 
-- **KL-on-softened-logits (Hinton):** the dominant distillation objective in literature; `T` widens the softmax so the teacher reveals dark knowledge (relative class similarities). `T=6` is a common mid-range default.
-- **α = 0.5:** balanced blend between hard-label CE and soft-label KL. Lower α biases toward ground-truth, higher α toward teacher — 0.5 is a safe default, easy to tune per dataset.
-- **CE on hard labels retained:** prevents the student from drifting away from true classes when teacher is imperfect.
-- **Why not feature-map distillation (FitNets / attention transfer):** feature matching adds hooks and projector heads; for a 3 M-param student + 12 M-param teacher, logit distillation already captures the bulk of the accuracy transfer at a fraction of the engineering cost.
+Use this file for Ray-Ban NPU deployment:
 
-## 4. `quantize` — Full INT8 (Snapdragon AR1 NPU ready)
+```text
+exported_models/mobilenetv4_int8.onnx
+```
 
-**Purpose.** Make the student lightweight for the **Hexagon NPU** on Meta Ray-Ban's **Qualcomm Snapdragon AR1 Gen 1**. The NPU is INT8-only — FP16 inference falls back to the CPU (slow + power-hungry), so full INT8 (activations + weights) is mandatory.
+It is a calibrated QDQ INT8 ONNX model. `exported_models/mobilenetv4.onnx` is only the FP32 intermediate used to build the INT8 export.
 
-**Behavior.**
+## Outputs
 
-- Loads the distilled checkpoint on CPU. Keeps a deep-copied FP32 reference for SNR scoring.
-- Applies one of these backends (`cfg["quantize"]["backend"]`):
-  - **`torchao_int8_dynamic_activation_int8_weight`** *(default)* — full INT8, dynamic activation quant at inference. No calibration data needed. The Hexagon NPU accepts this format.
-  - **`torchao_int8_weight_only`** *(legacy)* — size-only fallback. Smaller on disk but activations stay FP32; the NPU offloads them to the CPU, killing the latency budget.
-- After quantization, runs `quantization_snr_db()` on a small validation subset to compute **SNR in dB** vs the FP32 baseline and logs `snr_db_logit` / `snr_db_softmax` to MLflow.
-- Fallback if `torchao` isn't installed: `torch.quantization.quantize_dynamic({nn.Linear}, dtype=torch.qint8)`.
+```text
+checkpoints/
+  teacher_for_distill.pth
+  mobilenetv4_finetuned.pth
+  mobilenetv4_distilled.pth
+  mobilenetv4_quantized.pth
+  benchmark_comparison.json
+  benchmark_comparison.png
+  classification_report.md
+  mobilenetv4_quantized_confusion_matrix.png
+  mobilenetv4_quantized_confidence_analysis.png
+  teacher_training_curves.png
+  student_training_curves.png
 
-**SNR target band (logit-level).**
+exported_models/
+  mobilenetv4.onnx
+  mobilenetv4.onnx.data
+  mobilenetv4_int8.onnx
+  mobilenetv4.pt2
+  onnx_validation.json
+```
 
-| SNR (dB) | Verdict | Action |
-| --- | --- | --- |
-| < 20 | WARN | Quantization is hurting accuracy — re-tune |
-| 20 → 40 | PASS | Acceptable to good — deploy |
-| ≥ 40 | PASS (excellent) | No measurable degradation |
+## Validation Gates
 
-> **Note.** SNR is scored on the **val** split (the same split the early-stop / best-checkpoint selector uses). Not a leakage (the model never trains on `val`), but it's slightly optimistic vs. test-set SNR. For an unbiased number before deployment, call `quantization_snr_db()` once more on the **test** loader.
+Quantization validation:
 
-## Live Memory Monitor
+- PyTorch INT8 SNR is computed during `quantize`.
+- ONNX INT8 validation is computed during `export` and `report`.
+- `quantize.max_onnx_accuracy_drop` defaults to `0.05`.
+- Export fails if ONNX INT8 accuracy drops more than that threshold.
+- SNR is reported as PASS/WARN. It only fails export if `quantize.snr.fail_below_min: true`.
 
-`run_finetune` (Phase B) and `run_distill` print a one-line **RAM snapshot** at the end of each epoch, sampled via `psutil`:
+Current observed ONNX result:
+
+```text
+FP32 ONNX accuracy: 0.8920
+INT8 ONNX accuracy: 0.8709
+Accuracy drop:      0.0211
+INT8 ONNX size:     2.80 MB
+INT8 GOPs:          0.185
+Effective TOPS:     ~0.30 on local ONNX Runtime CPU
+SNR logit:          9.48 dB (WARN)
+```
+
+The effective TOPS value is local ONNX Runtime throughput. Real Ray-Ban NPU TOPS must be measured after QNN/NPU compilation on target hardware.
+
+## What We Tried
+
+- Torchao static INT8 PyTorch checkpoint:
+  - Worked for accuracy/SNR checking.
+  - Did not reduce `.pth` size much because torchao quantized only the final `nn.Linear`; MobileNetV4 is mostly convolution.
+  - Not the deployable artifact for Ray-Ban NPU.
+
+- ONNX QDQ with signed activations and signed weights (`QInt8/QInt8`):
+  - Produced a small INT8 ONNX.
+  - Failed accuracy badly, around `0.244`.
+  - SNR was near `0 dB`.
+
+- ONNX QDQ with entropy and percentile calibration:
+  - Still failed accuracy and SNR.
+  - Did not fix the quantization error.
+
+- ONNX QDQ with unsigned activations, signed per-channel weights (`QUInt8/QInt8`, `per_channel=True`):
+  - Fixed accuracy to `0.8709`.
+  - Kept the model small at about `2.80 MB`.
+  - SNR is still WARN, but accuracy drop is within the configured deployment gate.
+
+- FLOPs on torchao INT8 model:
+  - `fvcore` cannot trace torchao static INT8 tensors and hits a PyTorch tracing assertion.
+  - The pipeline now skips FLOPs for unsupported quantized PyTorch models instead of failing.
+  - ONNX INT8 reports estimated INT8 GOPs and effective TOPS instead.
+
+## Resume Behavior
+
+Training stages write `*.last.pth` resume files. If a run crashes, use:
 
 ```bash
-RAM 4.31GB / 16.00GB (27%) | MPS allocated 3.94GB
+python3 classification/src/main.py resume --origin-run-id <run-id>
 ```
 
-When the system's process RSS crosses **80%** of `psutil.virtual_memory().total`, the same line is prefixed with `[WARN]` and a hint to drop `batch_size`:
+To force a clean stage restart, delete that stage's `.last.pth` file. The best checkpoint `.pth` remains available for downstream stages.
 
-```bash
-[WARN] RAM 12.87GB / 16.00GB (80%) | MPS allocated 8.91GB -- above 80% threshold; consider dropping finetune.batch_size / distill.batch_size
-```
+## Cloud Storage
 
-The snapshot is the cheapest observable that catches OS-level reclaim pressure on **Apple M3 / 16 GB unified-memory** (the most constraining lane) and is intentionally non-fatal — you decide whether to abort, reduce batch size, or wait it out. `psutil>=5.9` is the only new dep.
-
-If you're unsure a full run will fit, start with `--quick-test`:
-
-```bash
-python classification/src/main.py run --quick-test      # 1 epoch per stage
-```
-
-If the WARN never fires over 1-2 epochs, the full run will fit.
-
-**Why this setup.**
-
-- **Full INT8 over weight-only:** the AR1 Hexagon NPU compiles INT8 ops only. Weight-only INT8 leaves activations in FP32, which the NPU rejects and falls back to the (small, power-limited) Kryo CPU — kills our latency budget.
-- **torchao over `torch.ao.quantization`:** torchao preserves the `nn.Module` graph (still call-able from Python and exportable to ONNX) and stays in step with current PyTorch releases. The legacy PyTorch dynamic path rewrites modules to `QuantizedLinear`, which breaks `torch.onnx.export`.
-- **Why not FP16:** FP16 inference still runs, but on the CPU on AR1; throughput is ~3-5× worse than NPU-bound INT8 and drains the glasses' small battery.
-- **Why not INT4 / GPTQ-style 4-bit:** the AR1 NPU does not have a stable INT4 fast path; the per-channel calibration cost outweighs the marginal size savings on a 3 M-param model.
-
-## 5. `benchmark` — Accuracy, Latency, Size, FLOPs
-
-**Purpose.** Produce the metrics that justify the pipeline.
-
-**Behavior.** Runs `evaluate()` on the test split, `benchmark_latency()` (100 runs + 10 warmup, ms), `model_size_mb()`, and `count_flops()` via `fvcore` if available.
-
-**Why this matters.** The whole point of **teacher → student → distill → quantize** is the trade-off table this step prints:
-
-- `test_acc` (quality)
-- `latency_ms` (speed, on the actual `device`)
-- `model_size_mb` (deploy footprint)
-- `gflops` (compute envelope)
-- `snr_db_logit` (quantization fidelity vs FP32, see §4)
-
-## 6. `export` — TorchScript, `torch.export`, ONNX
-
-**Purpose.** Produce portable artifacts independent of the training repo, including the format the Qualcomm QNN compiler needs.
-
-**Behavior.**
-
-- `torch.jit.trace` → `mobilenetv4.pt`
-- `torch.export.export` → `mobilenetv4.pt2`
-- `torch.onnx.export` → `mobilenetv4.onnx` (gated by `cfg["export"]["onnx"]`, opset 17 by default; batch axis dynamic)
-- All three saved under `exported_models/` and logged to MLflow.
-
-**Why three formats.**
-
-- **TorchScript:** mature, runs on `libtorch` C++ and PyTorch Mobile — broadest compatibility for older edge stacks.
-- **`torch.export`:** the modern ATen-graph format; future-proof for ExecuTorch / XNNPACK / Inductor. `mobilenetv4.pt2` → `executorch` is a one-liner off-pipeline.
-- **ONNX:** the input the **Qualcomm AI Hub / QNN compiler** expects. ONNX → `qnn-model-compiler` → `.dlc` is the path to a hardware-deployable, NPU-bound model on Meta Ray-Ban's AR1.
-
-## Common Choices Across Stages
-
-- **MLflow local SQLite** (`sqlite:///mlflow.db`): zero-ops tracking; switch to a remote URI via `paths.mlflow_tracking_uri`.
-- **Hydra configs** instead of argparse: layered overrides (`finetune.lr=…`, `@package _group_` per stage file) compose cleanly without copy-pasting defaults.
-- **Metaflow `@retry(times=2)` + `@resources(cpu/memory/gpu)`**: training steps retry on transient faults and declare compute needs explicitly — same code runs locally, on Kubernetes, or on AWS Batch.
-- **Determinism:** `torch.manual_seed(42)` at the top of each stage; v2 transforms are deterministic up to DataLoader worker shuffle.
-- **SNR (dB) gate** in `quantize`: every quantized checkpoint is graded against the FP32 baseline; the run aborts with a clear WARN if `snr_db_logit < 20`. Re-run with `--stage quantize` after seating a fresh dataset / activation quantizer if SNR drifts.
-
-## Intra-Stage Resume from Crash
-
-`run_train_teacher`, `run_finetune`, and `run_distill` write a **`*.last.pth`** companion file every epoch, distinct from the **`*.pth`** best-ckpt that downstream stages consume. Each `*.last.pth` carries enough state to pick a crashed loop up at the start of the next epoch:
-
-- `model.state_dict()`, `optimizer.state_dict()`, `scheduler.state_dict()` — restores AdamW momentum and the cosine LR position.
-- `torch` + `python.random` + `numpy` RNG state — shuffle order is reproducible across the resume boundary.
-- `epoch`, `best_acc`, `stall` — preserves the early-stop counter so e.g. `stall=9` after a crash continues into the patience check cleanly.
-
-Atomic writes via `.tmp` + `os.replace` mean a crash mid-write never leaves a half-truncated file observable.
-
-At startup, each runner calls `_try_resume(best_path, ...)` which returns `(start_epoch, best_acc, stall)`. On a fresh start that is `(0, 0.0, 0)`; on a resumed run the runner prints `Resumed from epoch 12 (best_acc=0.9134, stall=2)` and continues the loop from `epoch=start_epoch + 1` — **not** from epoch 1. If the resume state's `epoch` already met or exceeded `cfg[stage]["epochs"]` (e.g. the run completed before the crash happened to hit later), the training loop is skipped and the runner goes straight to the existing best-ckpt + `evaluate(test)` tail.
-
-To force a fresh start after a botched resume, delete the `*.last.pth` companion for that stage (`rm checkpoints/mobilenetv4_finetuned.last.pth`); the `*.pth` best is untouched and downstream stages (`run_distill`, `run_quantize`, ...) still find it by filename.
+`data.dir`, `paths.checkpoint_dir`, and `paths.export_dir` can be local, S3, or R2 paths. Remote data is staged into `paths.local_cache_dir`; outputs are synced back after stages.

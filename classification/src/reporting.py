@@ -330,7 +330,7 @@ def plot_benchmark_comparison(
     params = [r["params_m"] for r in results]
     accs = [r["test_acc"] for r in results]
     sizes = [r["size_mb"] for r in results]
-    gflops = [r.get("gflops", 0.0) for r in results]
+    compute = [r.get("int8_gops", r.get("gflops", 0.0)) for r in results]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle("Model Benchmark Comparison", fontsize=13, fontweight="bold")
@@ -366,13 +366,13 @@ def plot_benchmark_comparison(
     for i, v in enumerate(sizes):
         ax.text(v + 0.2, i, f"{v:.1f}MB", va="center", fontsize=9)
 
-    # FLOPs
+    # Compute
     ax = axes[1, 1]
-    ax.barh(names, gflops, color=bars_colors)
-    ax.set_xlabel("GFLOPs")
-    ax.set_title("Compute (GFLOPs)")
+    ax.barh(names, compute, color=bars_colors)
+    ax.set_xlabel("GFLOPs / INT8 GOPs")
+    ax.set_title("Compute")
     ax.invert_yaxis()
-    for i, v in enumerate(gflops):
+    for i, v in enumerate(compute):
         ax.text(v + 0.005, i, f"{v:.3f}", va="center", fontsize=9)
 
     fig.tight_layout(rect=(0, 0, 1, 0.95))
@@ -381,22 +381,30 @@ def plot_benchmark_comparison(
 
 def print_benchmark_table(results: List[dict]) -> None:
     """Print a formatted ASCII benchmark comparison table."""
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 120)
     print("BENCHMARK COMPARISON TABLE")
-    print("=" * 80)
-    header = f"{'Model':<40} {'Params(M)':>10} {'TestAcc':>10} {'Size(MB)':>10} {'GFLOPs':>10}"
+    print("=" * 120)
+    header = (
+        f"{'Model':<40} {'Params(M)':>10} {'TestAcc':>10} {'Size(MB)':>10} "
+        f"{'GFLOPs':>10} {'INT8 GOPs':>10} {'Lat(ms)':>10} {'TOPS':>10} {'SNR(dB)':>10}"
+    )
     print(header)
-    print("-" * 80)
+    print("-" * 120)
     for r in results:
+        snr = r.get("snr_db_logit")
         line = (
             f"{r['name']:<40} "
             f"{r['params_m']:>10.2f} "
             f"{r['test_acc']:>10.4f} "
             f"{r['size_mb']:>10.2f} "
-            f"{r.get('gflops', 0.0):>10.3f}"
+            f"{r.get('gflops', 0.0):>10.3f} "
+            f"{r.get('int8_gops', 0.0):>10.3f} "
+            f"{r.get('latency_ms', 0.0):>10.3f} "
+            f"{r.get('effective_tops', 0.0):>10.6f} "
+            f"{snr if isinstance(snr, float) else 0.0:>10.2f}"
         )
         print(line)
-    print("=" * 80)
+    print("=" * 120)
 
 
 @torch.inference_mode()

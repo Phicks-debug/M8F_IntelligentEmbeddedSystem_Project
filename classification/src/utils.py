@@ -133,7 +133,9 @@ def prepare_runtime_paths(cfg: dict[str, Any]) -> None:
     ``remote_*`` values for upload after each stage.
     """
     paths = cfg.setdefault("paths", {})
-    cache_root = Path(paths.get("local_cache_dir", ".cache/classification")).expanduser()
+    cache_root = Path(
+        paths.get("local_cache_dir", ".cache/classification")
+    ).expanduser()
     options = _storage_options(cfg)
 
     data_cfg = cfg.get("data", {})

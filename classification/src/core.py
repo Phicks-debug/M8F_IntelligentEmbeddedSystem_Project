@@ -154,7 +154,9 @@ def try_load_resume_state(
         return None
 
 
-def build_transforms(image_size: int, is_train: bool, light: bool = False) -> v2.Compose:
+def build_transforms(
+    image_size: int, is_train: bool, light: bool = False
+) -> v2.Compose:
     """Build train or eval transforms.
 
     Args:
@@ -170,7 +172,9 @@ def build_transforms(image_size: int, is_train: bool, light: bool = False) -> v2
             return v2.Compose(
                 [
                     v2.ToImage(),
-                    v2.RandomResizedCrop(image_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+                    v2.RandomResizedCrop(
+                        image_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)
+                    ),
                     v2.RandomHorizontalFlip(p=0.5),
                     v2.RandomRotation(degrees=(-8.0, 8.0), fill=128),
                     v2.ToDtype(torch.float32, scale=True),
@@ -479,7 +483,12 @@ def evaluate(
 
 
 def count_flops(model: nn.Module, input_size: tuple = (1, 3, 224, 224)) -> float:
-    """Estimate FLOPs using fvcore if available."""
+    """Estimate FLOPs using fvcore if available.
+
+    Some quantized tensor subclasses, including torchao static INT8 tensors,
+    cannot be traced by fvcore/PyTorch JIT. FLOPs are a reporting metric only,
+    so unsupported models return 0.0 instead of failing the benchmark stage.
+    """
     try:
         from fvcore.nn import FlopCountAnalysis
 
@@ -488,6 +497,9 @@ def count_flops(model: nn.Module, input_size: tuple = (1, 3, 224, 224)) -> float
         flops = FlopCountAnalysis(model, dummy)
         return flops.total() / 1e9  # GFLOPs
     except ImportError:
+        return 0.0
+    except Exception as exc:
+        print(f"  [WARN] FLOPs estimation skipped: {exc}")
         return 0.0
 
 

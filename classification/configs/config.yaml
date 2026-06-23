@@ -43,17 +43,21 @@ quantize:
     split: val
     batch_size: 8
     batches: 32
+  max_onnx_accuracy_drop: 0.05
   snr:
     batch_size: 8
     batches: 16  # cap on calibration batches for SNR (dB) scoring
+    min_db: 20.0
+    fail_below_min: false
 
 export:
   onnx: true # FP32 intermediate ONNX
   int8_onnx: true # final Ray-Ban NPU deployment ONNX (QDQ INT8)
-  opset: 17
+  opset: 18
 
 benchmark:
   batch_size: 64  # inference-only (no backward, no optimizer state), so 64 is safe and amortizes launch overhead
+  onnx_runs: 100
 
 paths:
   # data.dir, checkpoint_dir, and export_dir can be local paths or object-store

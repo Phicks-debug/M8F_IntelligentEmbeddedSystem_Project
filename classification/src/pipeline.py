@@ -3,9 +3,13 @@ Pipeline stage runners for mushroom classification.
 """
 
 import json
+import math
+import os
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -391,7 +395,9 @@ def run_finetune(cfg: dict) -> Path:
 
     model = make_student(cfg["finetune"]["arch"], cfg["data"]["num_classes"]).to(device)
     print(f"Student params: {count_params(model):,}")
-    print(f"  student_lr={student_lr}, light_aug={light_aug}, patience={student_patience}")
+    print(
+        f"  student_lr={student_lr}, light_aug={light_aug}, patience={student_patience}"
+    )
 
     log_params(
         {
@@ -581,7 +587,9 @@ def _checkpoint_quantization_calibration(checkpoint_path: Path) -> Optional[dict
     try:
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     except Exception as exc:
-        print(f"  [WARN] Could not read calibration metadata from {checkpoint_path}: {exc}")
+        print(
+            f"  [WARN] Could not read calibration metadata from {checkpoint_path}: {exc}"
+        )
         return None
     calibration = state.get("calibration")
     return calibration if isinstance(calibration, dict) else None
@@ -630,7 +638,9 @@ def _calibrate_linear_activation_ranges(
             hooks.append(module.register_forward_hook(make_hook(name)))
 
     if not hooks:
-        raise RuntimeError("Static quantization calibration found no nn.Linear modules.")
+        raise RuntimeError(
+            "Static quantization calibration found no nn.Linear modules."
+        )
 
     model.eval()
     seen_batches = 0
@@ -855,10 +865,427 @@ def _export_calibrated_int8_onnx(
         model_output=str(int8_onnx_path),
         calibration_data_reader=ImageCalibrationReader(),
         quant_format=ort_quant.QuantFormat.QDQ,
-        activation_type=ort_quant.QuantType.QInt8,
+        activation_type=ort_quant.QuantType.QUInt8,
         weight_type=ort_quant.QuantType.QInt8,
+        per_channel=True,
     )
     return True
+
+
+def _snr_verdict(snr_db: float) -> str:
+    if snr_db < 20.0:
+        return "WARN: SNR below 20 dB"
+    if snr_db >= 40.0:
+        return "PASS: SNR >= 40 dB (excellent)"
+    return "PASS: SNR in 20-40 dB band"
+
+
+def _softmax_np(logits: np.ndarray) -> np.ndarray:
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    exp = np.exp(shifted)
+    return exp / exp.sum(axis=1, keepdims=True)
+
+
+def _cross_entropy_np(logits: np.ndarray, labels: np.ndarray) -> float:
+    probs = _softmax_np(logits)
+    picked = probs[np.arange(labels.shape[0]), labels]
+    return float(-np.log(np.clip(picked, 1e-12, 1.0)).mean())
+
+
+def _estimate_onnx_gops(path: Path) -> float:
+    """Estimate ONNX Conv/Gemm/MatMul operations in GOPs.
+
+    This is an approximation for deployment reporting. TOPS is hardware and
+    runtime dependent, so the pipeline reports effective TOPS separately from
+    ONNX Runtime latency.
+    """
+    try:
+        import onnx
+        from onnx import shape_inference
+    except ImportError:
+        return 0.0
+
+    try:
+        model = shape_inference.infer_shapes(onnx.load(path))
+    except Exception:
+        model = onnx.load(path)
+
+    shapes: dict[str, list[int]] = {}
+    for value in (
+        list(model.graph.input)
+        + list(model.graph.value_info)
+        + list(model.graph.output)
+    ):
+        dims = []
+        for dim in value.type.tensor_type.shape.dim:
+            dims.append(int(dim.dim_value) if dim.dim_value else 1)
+        shapes[value.name] = dims
+
+    initializer_shapes = {
+        init.name: list(init.dims) for init in model.graph.initializer
+    }
+    aliases = {
+        node.output[0]: node.input[0]
+        for node in model.graph.node
+        if node.op_type == "DequantizeLinear" and node.input
+    }
+
+    def initializer_shape(name: str) -> list[int]:
+        return initializer_shapes.get(
+            name, initializer_shapes.get(aliases.get(name, "")) or []
+        )
+
+    ops = 0
+    for node in model.graph.node:
+        if node.op_type == "Conv" and len(node.input) >= 2:
+            out_shape = shapes.get(node.output[0], [])
+            weight_shape = initializer_shape(node.input[1])
+            if len(out_shape) >= 4 and len(weight_shape) >= 4:
+                batch, out_ch, out_h, out_w = out_shape[:4]
+                _, in_ch_per_group, k_h, k_w = weight_shape[:4]
+                ops += batch * out_ch * out_h * out_w * in_ch_per_group * k_h * k_w
+        elif node.op_type == "Gemm" and len(node.input) >= 2:
+            out_shape = shapes.get(node.output[0], [])
+            weight_shape = initializer_shape(node.input[1])
+            if len(out_shape) >= 2 and len(weight_shape) >= 2:
+                batch = out_shape[0]
+                out_features = out_shape[-1]
+                trans_b = 0
+                for attr in node.attribute:
+                    if attr.name == "transB":
+                        trans_b = int(attr.i)
+                        break
+                in_features = weight_shape[1] if trans_b else weight_shape[0]
+                ops += batch * out_features * in_features
+        elif node.op_type == "MatMul" and len(node.input) >= 2:
+            a_shape = shapes.get(node.input[0], initializer_shape(node.input[0]))
+            b_shape = shapes.get(node.input[1], initializer_shape(node.input[1]))
+            out_shape = shapes.get(node.output[0], [])
+            if len(a_shape) >= 2 and len(b_shape) >= 2 and len(out_shape) >= 2:
+                batch = int(np.prod(out_shape[:-1])) if len(out_shape) > 1 else 1
+                ops += batch * b_shape[-2] * b_shape[-1]
+
+    return ops / 1e9
+
+
+def _run_onnx_session(session, images: torch.Tensor) -> np.ndarray:
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: images.cpu().numpy().astype(np.float32)})
+    return outputs[0]
+
+
+def _benchmark_onnx_model(
+    path: Path,
+    loader: DataLoader,
+    *,
+    max_latency_runs: int = 100,
+) -> dict:
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    total_loss, total_correct, n = 0.0, 0, 0
+    for images, labels in loader:
+        logits = _run_onnx_session(session, images)
+        labels_np = labels.numpy()
+        total_loss += _cross_entropy_np(logits, labels_np) * labels_np.shape[0]
+        total_correct += int((logits.argmax(axis=1) == labels_np).sum())
+        n += labels_np.shape[0]
+
+    first_batch = next(iter(loader))[0][:1]
+    for _ in range(10):
+        _run_onnx_session(session, first_batch)
+    start = time.perf_counter()
+    for _ in range(max_latency_runs):
+        _run_onnx_session(session, first_batch)
+    latency_ms = ((time.perf_counter() - start) / max_latency_runs) * 1000.0
+
+    size_mb = _size_mb(path)
+    gops = _estimate_onnx_gops(path)
+    effective_tops = (gops / latency_ms) if latency_ms > 0 else 0.0
+    return {
+        "test_loss": total_loss / max(n, 1),
+        "test_acc": total_correct / max(n, 1),
+        "latency_ms": latency_ms,
+        "size_mb": size_mb,
+        "int8_gops": gops,
+        "effective_tops": effective_tops,
+    }
+
+
+def _onnx_snr_db(
+    fp32_path: Path,
+    int8_path: Path,
+    loader: DataLoader,
+    *,
+    max_batches: int,
+) -> dict[str, float]:
+    import onnxruntime as ort
+
+    fp32_session = ort.InferenceSession(
+        str(fp32_path), providers=["CPUExecutionProvider"]
+    )
+    int8_session = ort.InferenceSession(
+        str(int8_path), providers=["CPUExecutionProvider"]
+    )
+    sig_powers: list[float] = []
+    noise_powers: list[float] = []
+    sig_softmax: list[float] = []
+    noise_softmax: list[float] = []
+    seen = 0
+
+    for images, _ in loader:
+        if seen >= max_batches:
+            break
+        fp32_logits = _run_onnx_session(fp32_session, images)
+        int8_logits = _run_onnx_session(int8_session, images)
+        diff = fp32_logits - int8_logits
+        sig_powers.append(float(np.mean(fp32_logits**2)))
+        noise_powers.append(float(np.mean(diff**2)))
+        fp32_probs = _softmax_np(fp32_logits)
+        int8_probs = _softmax_np(int8_logits)
+        sig_softmax.append(float(np.mean(fp32_probs**2)))
+        noise_softmax.append(float(np.mean((fp32_probs - int8_probs) ** 2)))
+        seen += 1
+
+    if seen == 0:
+        raise ValueError("ONNX SNR loader produced 0 batches")
+
+    sig = sum(sig_powers) / seen
+    noise = sum(noise_powers) / seen
+    sig_s = sum(sig_softmax) / seen
+    noise_s = sum(noise_softmax) / seen
+    return {
+        "snr_db_logit": 10.0 * math.log10(max(sig / max(noise, 1e-12), 1e-12)),
+        "snr_db_softmax": 10.0 * math.log10(max(sig_s / max(noise_s, 1e-12), 1e-12)),
+        "signal_power_logit": sig,
+        "noise_power_logit": noise,
+    }
+
+
+def validate_onnx_exports(cfg: dict) -> list[dict]:
+    """Validate exported FP32 and INT8 ONNX models on the test split."""
+    export_dir = Path(cfg["paths"]["export_dir"])
+    fp32_path = export_dir / "mobilenetv4.onnx"
+    int8_path = export_dir / "mobilenetv4_int8.onnx"
+    if not fp32_path.exists() or not int8_path.exists():
+        missing = [str(p) for p in (fp32_path, int8_path) if not p.exists()]
+        print(f"  [WARN] ONNX validation skipped; missing: {missing}")
+        return []
+
+    _, _, test_loader, _ = get_dataloaders(
+        data_dir=Path(cfg["data"]["dir"]),
+        image_size=cfg["data"]["image_size"],
+        num_classes=cfg["data"]["num_classes"],
+        batch_size=cfg["benchmark"]["batch_size"],
+        workers=cfg["data"]["workers"],
+        mixup=False,
+    )
+    latency_runs = cfg.get("benchmark", {}).get("onnx_runs", 100)
+    fp32_metrics = _benchmark_onnx_model(
+        fp32_path, test_loader, max_latency_runs=latency_runs
+    )
+    int8_metrics = _benchmark_onnx_model(
+        int8_path, test_loader, max_latency_runs=latency_runs
+    )
+    snr_cfg = cfg.get("quantize", {}).get("snr", {})
+    snr = _onnx_snr_db(
+        fp32_path,
+        int8_path,
+        test_loader,
+        max_batches=snr_cfg.get("batches", 16),
+    )
+    verdict = _snr_verdict(snr["snr_db_logit"])
+    quantize_cfg = cfg.get("quantize", {})
+    snr_cfg = quantize_cfg.get("snr", {})
+    min_snr_db = snr_cfg.get("min_db", 20.0)
+    fail_below_min_snr = snr_cfg.get("fail_below_min", False)
+    max_accuracy_drop = quantize_cfg.get("max_onnx_accuracy_drop", 0.05)
+    accuracy_drop = fp32_metrics["test_acc"] - int8_metrics["test_acc"]
+    print("ONNX validation:")
+    print(
+        f"  FP32 ONNX: acc={fp32_metrics['test_acc']:.4f} "
+        f"loss={fp32_metrics['test_loss']:.4f} "
+        f"latency={fp32_metrics['latency_ms']:.3f}ms "
+        f"size={fp32_metrics['size_mb']:.2f}MB"
+    )
+    print(
+        f"  INT8 ONNX: acc={int8_metrics['test_acc']:.4f} "
+        f"loss={int8_metrics['test_loss']:.4f} "
+        f"latency={int8_metrics['latency_ms']:.3f}ms "
+        f"size={int8_metrics['size_mb']:.2f}MB "
+        f"int8_gops={int8_metrics['int8_gops']:.3f} "
+        f"effective_tops={int8_metrics['effective_tops']:.6f}"
+    )
+    print(
+        f"  ONNX INT8 SNR(logit)={snr['snr_db_logit']:.2f} dB [{verdict}] "
+        f"SNR(softmax)={snr['snr_db_softmax']:.2f} dB"
+    )
+
+    results = [
+        {
+            "name": "ONNX FP32",
+            "params_m": 0.0,
+            "test_acc": fp32_metrics["test_acc"],
+            "test_loss": fp32_metrics["test_loss"],
+            "size_mb": fp32_metrics["size_mb"],
+            "gflops": fp32_metrics["int8_gops"],
+            "latency_ms": fp32_metrics["latency_ms"],
+            "effective_tops": 0.0,
+        },
+        {
+            "name": "ONNX INT8 QDQ",
+            "params_m": 0.0,
+            "test_acc": int8_metrics["test_acc"],
+            "test_loss": int8_metrics["test_loss"],
+            "size_mb": int8_metrics["size_mb"],
+            "gflops": 0.0,
+            "int8_gops": int8_metrics["int8_gops"],
+            "latency_ms": int8_metrics["latency_ms"],
+            "effective_tops": int8_metrics["effective_tops"],
+            "snr_db_logit": snr["snr_db_logit"],
+            "snr_db_softmax": snr["snr_db_softmax"],
+            "snr_verdict": verdict,
+            "snr_min_db": min_snr_db,
+            "snr_pass": snr["snr_db_logit"] >= min_snr_db,
+            "snr_fail_below_min": fail_below_min_snr,
+            "accuracy_drop": accuracy_drop,
+            "max_accuracy_drop": max_accuracy_drop,
+            "accuracy_pass": accuracy_drop <= max_accuracy_drop,
+        },
+    ]
+    summary_path = export_dir / "onnx_validation.json"
+    with open(summary_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  ONNX validation saved: {summary_path}")
+    log_artifact(summary_path)
+    log_metrics(
+        {
+            "onnx_int8_test_acc": int8_metrics["test_acc"],
+            "onnx_int8_latency_ms": int8_metrics["latency_ms"],
+            "onnx_int8_effective_tops": int8_metrics["effective_tops"],
+            "onnx_int8_snr_db_logit": snr["snr_db_logit"],
+            "onnx_int8_snr_db_softmax": snr["snr_db_softmax"],
+        }
+    )
+    return results
+
+
+def _write_markdown_report(cfg: dict, results: list[dict]) -> Path:
+    ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
+    export_dir = Path(cfg["paths"]["export_dir"])
+    report_path = ckpt_dir / "classification_report.md"
+
+    def rel(path: Path) -> str:
+        return os.path.relpath(path, start=ckpt_dir)
+
+    lines = [
+        "# Classification Report",
+        "",
+        "## Summary",
+        "",
+        "| Model | Accuracy | Loss | Size MB | GFLOPs | INT8 GOPs | Lat ms | TOPS | SNR dB |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in results:
+        lines.append(
+            "| {name} | {acc:.4f} | {loss:.4f} | {size:.2f} | {gflops:.3f} | "
+            "{int8_gops:.3f} | {latency:.3f} | {tops:.6f} | {snr:.2f} |".format(
+                name=row.get("name", ""),
+                acc=row.get("test_acc", 0.0),
+                loss=row.get("test_loss", 0.0),
+                size=row.get("size_mb", 0.0),
+                gflops=row.get("gflops", 0.0),
+                int8_gops=row.get("int8_gops", 0.0),
+                latency=row.get("latency_ms", 0.0),
+                tops=row.get("effective_tops", 0.0),
+                snr=row.get("snr_db_logit", 0.0),
+            )
+        )
+
+    diagrams = [
+        (
+            "Benchmark comparison",
+            ckpt_dir / "benchmark_comparison.png",
+        ),
+        (
+            "Quantized confusion matrix",
+            ckpt_dir / "mobilenetv4_quantized_confusion_matrix.png",
+        ),
+        (
+            "Quantized confidence analysis",
+            ckpt_dir / "mobilenetv4_quantized_confidence_analysis.png",
+        ),
+        (
+            "Teacher training curves",
+            ckpt_dir / "teacher_training_curves.png",
+        ),
+        (
+            "Student training curves",
+            ckpt_dir / "student_training_curves.png",
+        ),
+        (
+            "Distillation training curves",
+            ckpt_dir / "distill_training_curves.png",
+        ),
+    ]
+    lines.extend(["", "## Diagrams", ""])
+    for title, path in diagrams:
+        if path.exists():
+            lines.extend([f"### {title}", "", f"![{title}]({rel(path)})", ""])
+
+    artifacts = [
+        ckpt_dir / "benchmark_comparison.json",
+        export_dir / "onnx_validation.json",
+        ckpt_dir / "pipeline_summary.json",
+        export_dir / "mobilenetv4_int8.onnx",
+        export_dir / "mobilenetv4.onnx",
+    ]
+    lines.extend(["## Files", ""])
+    for path in artifacts:
+        if path.exists():
+            label = path.name
+            target = rel(path)
+            lines.append(f"- [{label}]({target})")
+
+    int8_rows = [row for row in results if row.get("name") == "ONNX INT8 QDQ"]
+    if int8_rows:
+        row = int8_rows[0]
+        lines.extend(
+            [
+                "",
+                "## Deployment Note",
+                "",
+                "`exported_models/mobilenetv4_int8.onnx` is the Ray-Ban NPU deployment candidate.",
+                f"SNR verdict: `{row.get('snr_verdict', 'n/a')}`.",
+                f"Accuracy drop: `{row.get('accuracy_drop', 0.0):.4f}` "
+                f"(limit `{row.get('max_accuracy_drop', 0.0):.4f}`).",
+            ]
+        )
+
+    report_path.write_text("\n".join(lines) + "\n")
+    print(f"  Markdown report saved: {report_path}")
+    log_artifact(report_path)
+    return report_path
+
+
+def _require_onnx_validation_pass(results: list[dict]) -> None:
+    for result in results:
+        if result.get("name") != "ONNX INT8 QDQ":
+            continue
+        if not result.get("accuracy_pass", False):
+            raise RuntimeError(
+                "INT8 ONNX validation failed: "
+                f"accuracy_drop={result.get('accuracy_drop', 0.0):.4f}, "
+                f"allowed<={result.get('max_accuracy_drop', 0.05):.4f}. "
+                "Do not deploy this Ray-Ban NPU artifact."
+            )
+        if result.get("snr_fail_below_min") and not result.get("snr_pass", False):
+            raise RuntimeError(
+                "INT8 ONNX validation failed: "
+                f"SNR={result.get('snr_db_logit', 0.0):.2f} dB, "
+                f"required>={result.get('snr_min_db', 20.0):.2f} dB. "
+                "Do not deploy this Ray-Ban NPU artifact."
+            )
 
 
 def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
@@ -909,7 +1336,9 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
     calibration = None
     if backend == "torchao_int8_static_activation_int8_weight":
         cal_cfg = cfg.get("quantize", {}).get("calibration", {})
-        cal_batch_size = cal_cfg.get("batch_size", cfg.get("quantize", {}).get("snr", {}).get("batch_size", 8))
+        cal_batch_size = cal_cfg.get(
+            "batch_size", cfg.get("quantize", {}).get("snr", {}).get("batch_size", 8)
+        )
         cal_batches = cal_cfg.get("batches", 32)
         cal_split = cal_cfg.get("split", "val")
         cal_train, cal_val, cal_test, _ = get_dataloaders(
@@ -1185,12 +1614,16 @@ def run_full_benchmark_comparison(cfg: dict, class_names: list[str]) -> list[dic
         )
 
     if results:
+        onnx_results = validate_onnx_exports(cfg)
+        if onnx_results:
+            results.extend(onnx_results)
         print_benchmark_table(results)
         plot_benchmark_comparison(results, ckpt_dir / "benchmark_comparison.png")
         summary_path = ckpt_dir / "benchmark_comparison.json"
         with open(summary_path, "w") as f:
             json.dump(results, f, indent=2)
         print(f"  Comparison summary saved: {summary_path}")
+        _write_markdown_report(cfg, results)
         sync_runtime_outputs(cfg, "checkpoint_dir")
     else:
         print("  [WARN] No checkpoints found for benchmark comparison.")
@@ -1201,6 +1634,7 @@ def run_full_benchmark_comparison(cfg: dict, class_names: list[str]) -> list[dic
 def run_export(cfg: dict, checkpoint_path: Path) -> dict:
     """Export to TorchScript (.pt) and torch.export (.pt2). Returns dict of paths."""
     device = "cpu"
+    require_int8_onnx = cfg.get("export", {}).get("int8_onnx", True)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     model, _ = _make_student_for_checkpoint(cfg, checkpoint_path, device)
@@ -1276,8 +1710,18 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
                     results["deployment_onnx"] = str(int8_onnx_path)
                     results["deployment_precision"] = "int8_qdq"
                     log_artifact(int8_onnx_path)
+                    onnx_validation = validate_onnx_exports(cfg)
+                    results["onnx_validation"] = onnx_validation
+                    _require_onnx_validation_pass(onnx_validation)
+                else:
+                    raise RuntimeError(
+                        "INT8 ONNX export is required for Ray-Ban NPU deployment "
+                        "but was not produced."
+                    )
         except Exception as e:
             print(f"ONNX export failed: {e}")
+            if require_int8_onnx:
+                raise
 
     log_params(
         {

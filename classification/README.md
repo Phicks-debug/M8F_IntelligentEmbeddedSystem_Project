@@ -116,17 +116,21 @@ checkpoints/
   *_confidence_analysis.png
   benchmark_comparison.json
   benchmark_comparison.png
+  classification_report.md
 
 exported_models/
-  mobilenetv4.pt
   mobilenetv4.pt2
   mobilenetv4.onnx
+  mobilenetv4.onnx.data
   mobilenetv4_int8.onnx
+  onnx_validation.json
 ```
 
 Use `exported_models/mobilenetv4_int8.onnx` as the Ray-Ban NPU deployment model. It is a calibrated QDQ INT8 ONNX model. `mobilenetv4.onnx` is only the FP32 intermediate used to build the INT8 export.
 
 The `quantize` stage also saves a calibrated PyTorch INT8 checkpoint at `checkpoints/mobilenetv4_quantized.pth`.
+
+The export/report steps validate ONNX accuracy, latency, INT8 SNR, estimated INT8 GOPs, and effective TOPS from ONNX Runtime latency. Export fails if INT8 ONNX accuracy drops more than `quantize.max_onnx_accuracy_drop`; SNR is reported as PASS/WARN. Ray-Ban NPU TOPS must still be confirmed with the target compiler/runtime.
 
 Reruns use fixed output filenames. Training checkpoints update when a new best validation score is saved; quantize and export outputs overwrite their previous files.
 

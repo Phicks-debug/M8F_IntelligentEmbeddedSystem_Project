@@ -54,6 +54,7 @@ class TrainingFlow(FlowSpec):
         """Initialize Hydra config and validate data."""
         import hydra
         from omegaconf import OmegaConf
+
         from src.utils import prepare_runtime_paths
 
         with hydra.initialize_config_dir(
@@ -221,7 +222,7 @@ class TrainingFlow(FlowSpec):
         if self.stage not in ("all", "benchmark"):
             print(f"Skipping benchmark (stage={self.stage})")
             self.metrics = {}
-            self.next(self.report)
+            self.next(self.export)
             return
 
         ckpt = Path(self.cfg["paths"]["checkpoint_dir"]) / "mobilenetv4_quantized.pth"
@@ -249,44 +250,16 @@ class TrainingFlow(FlowSpec):
             self.metrics = run_benchmark(self.cfg, ckpt, class_names=class_names)
 
         print(f"Benchmark metrics: {self.metrics}")
-        self.next(self.report)
-
-    @resources(cpu=4, memory=16000)
-    @step
-    def report(self):
-        """Generate multi-model benchmark comparison and final analysis."""
-        if self.stage not in ("all", "benchmark", "report"):
-            print(f"Skipping report (stage={self.stage})")
-            self.next(self.export)
-            return
-
-        class_names = getattr(self, "class_names", None)
-        if class_names is None:
-            print("  [WARN] class_names not available; skipping comparison report.")
-            self.next(self.export)
-            return
-
-        from src.pipeline import run_full_benchmark_comparison
-        from src.tracking import start_run
-
-        tracking_uri = self.cfg.get("paths", {}).get("mlflow_tracking_uri")
-        with start_run(
-            "mushroom_classification", run_name="report", tracking_uri=tracking_uri
-        ):
-            self.comparison_results = run_full_benchmark_comparison(
-                self.cfg, class_names
-            )
-
         self.next(self.export)
 
     @resources(cpu=4, memory=16000)
     @step
     def export(self):
-        """Export TorchScript and torch.export artifacts."""
+        """Export TorchScript, torch.export, and ONNX artifacts."""
         if self.stage not in ("all", "export"):
             print(f"Skipping export (stage={self.stage})")
             self.exported = {}
-            self.next(self.end)
+            self.next(self.report)
             return
 
         ckpt = Path(self.cfg["paths"]["checkpoint_dir"]) / "mobilenetv4_quantized.pth"
@@ -327,6 +300,34 @@ class TrainingFlow(FlowSpec):
             sync_runtime_outputs(self.cfg, "checkpoint_dir", "export_dir")
 
         print(f"Exported artifacts: {self.exported}")
+        self.next(self.report)
+
+    @resources(cpu=4, memory=16000)
+    @step
+    def report(self):
+        """Generate multi-model benchmark comparison and final analysis."""
+        if self.stage not in ("all", "benchmark", "report"):
+            print(f"Skipping report (stage={self.stage})")
+            self.next(self.end)
+            return
+
+        class_names = getattr(self, "class_names", None)
+        if class_names is None:
+            print("  [WARN] class_names not available; skipping comparison report.")
+            self.next(self.end)
+            return
+
+        from src.pipeline import run_full_benchmark_comparison
+        from src.tracking import start_run
+
+        tracking_uri = self.cfg.get("paths", {}).get("mlflow_tracking_uri")
+        with start_run(
+            "mushroom_classification", run_name="report", tracking_uri=tracking_uri
+        ):
+            self.comparison_results = run_full_benchmark_comparison(
+                self.cfg, class_names
+            )
+
         self.next(self.end)
 
     @step
