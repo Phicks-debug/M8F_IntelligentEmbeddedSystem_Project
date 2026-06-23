@@ -2,8 +2,9 @@
 Utility helpers for checkpoint passing and device selection.
 """
 
-import torch
 from pathlib import Path
+
+import torch
 
 
 def get_device(preferred: str = "auto") -> str:

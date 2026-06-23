@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from src.core import (
+    _live_mem_snapshot,
     benchmark_latency,
     build_scheduler,
     count_flops,
@@ -25,7 +26,6 @@ from src.core import (
     quantization_snr_db,
     save_checkpoint,
     train_one_epoch,
-    _live_mem_snapshot,
 )
 from src.tracking import log_artifact, log_metrics, log_params
 from src.utils import get_device

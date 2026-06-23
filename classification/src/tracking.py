@@ -2,13 +2,18 @@
 MLflow experiment tracking utilities.
 """
 
-import mlflow
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
+import mlflow
 
 
-def start_run(experiment_name: str, run_name: Optional[str] = None, tracking_uri: Optional[str] = None):
+def start_run(
+    experiment_name: str,
+    run_name: Optional[str] = None,
+    tracking_uri: Optional[str] = None,
+):
     """Start an MLflow run. Returns the active run."""
     if tracking_uri:
         mlflow.set_tracking_uri(tracking_uri)

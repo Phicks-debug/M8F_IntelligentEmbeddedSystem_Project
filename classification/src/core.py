@@ -137,8 +137,11 @@ def get_dataloaders(
     kwargs: dict = dict(batch_size=batch_size, num_workers=workers, pin_memory=False)
 
     train = DataLoader(
-        train_ds, shuffle=True,
-        collate_fn=(lambda batch: _mixup_collate(batch, num_classes)) if mixup else None,
+        train_ds,
+        shuffle=True,
+        collate_fn=(lambda batch: _mixup_collate(batch, num_classes))
+        if mixup
+        else None,
         **kwargs,
     )
     val = DataLoader(val_ds, shuffle=False, **kwargs)
@@ -163,6 +166,7 @@ def assert_class_balance(ds, warn_ratio: float = 2.0) -> dict:
         ``{label: count}`` mapping the same labels returned by ``ds[i][1]``.
     """
     from collections import Counter
+
     targets_attr = getattr(ds, "targets", None)
     if targets_attr is None:
         try:
@@ -287,7 +291,9 @@ def train_one_epoch(
                 with torch.no_grad():
                     t_logits = teacher(images)
                 loss = distillation_loss(
-                    outputs, t_logits, targets,
+                    outputs,
+                    t_logits,
+                    targets,
                     T=distill_cfg["T"],
                     alpha=distill_cfg["alpha"],
                     criterion=criterion,
@@ -300,7 +306,9 @@ def train_one_epoch(
                     acc_val = accuracy(outputs, targets[0].argmax(dim=1))
                 else:
                     loss = criterion(outputs, targets)
-                    acc_targets = targets.argmax(dim=1) if targets.ndim == 2 else targets
+                    acc_targets = (
+                        targets.argmax(dim=1) if targets.ndim == 2 else targets
+                    )
                     acc_val = accuracy(outputs, acc_targets)
         loss.backward()
         optimizer.step()
@@ -436,11 +444,11 @@ def quantization_snr_db(
             fp32_out = fp32_model(images)
             int8_out = int8_model(images)
             diff = fp32_out - int8_out
-            sig_powers.append((fp32_out ** 2).mean().item())
-            noise_powers.append((diff ** 2).mean().item())
+            sig_powers.append((fp32_out**2).mean().item())
+            noise_powers.append((diff**2).mean().item())
             fp32_p = F.softmax(fp32_out, dim=1)
             int8_p = F.softmax(int8_out, dim=1)
-            sig_softmax.append((fp32_p ** 2).mean().item())
+            sig_softmax.append((fp32_p**2).mean().item())
             noise_softmax.append(((fp32_p - int8_p) ** 2).mean().item())
             seen += 1
 
@@ -461,4 +469,3 @@ def quantization_snr_db(
         "signal_power_logit": sig,
         "noise_power_logit": noise,
     }
-
