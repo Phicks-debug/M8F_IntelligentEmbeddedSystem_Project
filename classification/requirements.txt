@@ -16,7 +16,7 @@ tqdm
 numpy
 
 # Quantization (optional)
-torchao>=0.3
+torchao>=0.4
 
 # Benchmarking (optional)
 fvcore

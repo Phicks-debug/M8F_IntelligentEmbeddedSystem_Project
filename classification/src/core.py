@@ -78,20 +78,60 @@ def get_dataloaders(
         "Re-run data preprocessing."
     )
 
+    # Bias check: warn if class counts are skewed (max/min ratio > warn_ratio).
+    assert_class_balance(train_ds, warn_ratio=2.0)
+
     kwargs: dict = dict(batch_size=batch_size, num_workers=workers, pin_memory=False)
 
     train = DataLoader(
-        train_ds,
-        shuffle=True,
-        collate_fn=(lambda batch: _mixup_collate(batch, num_classes))
-        if mixup
-        else None,
+        train_ds, shuffle=True,
+        collate_fn=(lambda batch: _mixup_collate(batch, num_classes)) if mixup else None,
         **kwargs,
     )
     val = DataLoader(val_ds, shuffle=False, **kwargs)
     test = DataLoader(test_ds, shuffle=False, **kwargs)
 
     return train, val, test
+
+
+def assert_class_balance(ds, warn_ratio: float = 2.0) -> dict:
+    """Print per-class counts from a dataset and warn if imbalance exceeds ratio.
+
+    Helps catch dataset skew **before** training starts (which can bias a
+    classifier toward majority classes). Returns ``dict[label -> count]``.
+
+    Args:
+        ds: any object exposing a list-like ``.targets`` attribute (this
+            matches torchvision's ``ImageFolder`` / ``Subset``). Falls back
+            to enumerating ``ds[i][1]`` otherwise.
+        warn_ratio: emit a WARN line when ``max_count / min_count > warn_ratio``.
+
+    Returns:
+        ``{label: count}`` mapping the same labels returned by ``ds[i][1]``.
+    """
+    from collections import Counter
+    targets_attr = getattr(ds, "targets", None)
+    if targets_attr is None:
+        try:
+            targets_attr = [int(ds[i][1]) for i in range(len(ds))]
+        except Exception as exc:
+            raise RuntimeError(
+                "assert_class_balance: ds has no .targets and no indexable (sample, label) access"
+            ) from exc
+    counts = Counter(targets_attr)
+    n_total = sum(counts.values())
+    print(f"Class counts (train n={n_total}): {dict(sorted(counts.items()))}")
+    if counts:
+        max_c = max(counts.values())
+        min_c = min(counts.values())
+        ratio = max_c / max(min_c, 1)
+        if ratio > warn_ratio:
+            print(
+                f"  [WARN] Class imbalance ratio = {ratio:.2f}× (max/min) exceeds "
+                f"threshold {warn_ratio:.1f}×. Consider WeightedRandomSampler or "
+                "class-weighted CrossEntropyLoss."
+            )
+    return dict(counts)
 
 
 def make_student(arch: str, num_classes: int, pretrained: bool = True) -> nn.Module:
@@ -280,3 +320,87 @@ def benchmark_latency(
 def model_size_mb(path: Path) -> float:
     """Return model file size in MB."""
     return path.stat().st_size / (1024 * 1024)
+
+
+def quantization_snr_db(
+    fp32_model: nn.Module,
+    int8_model: nn.Module,
+    loader: DataLoader,
+    device: str = "cpu",
+    max_batches: int = 32,
+) -> dict[str, float]:
+    """Compute Signal-to-Noise Ratio (dB) between FP32 and INT8 model outputs.
+
+    SNR_dB = 10 * log10(P_signal / P_noise)
+
+    where P_signal = mean over batch of mean(|fp32_logit|^2)
+    and  P_noise  = mean over batch of mean(|(fp32 - int8)_logit|^2).
+
+    Computed on logits (pre-softmax). Also returns softmax-level SNR for
+    interpretability: a high logit-SNR with low softmax-SNR suggests the
+    quantization is preserving prediction magnitudes but compressing
+    probability mass.
+
+    Qualitative bands for INT8 quantized vision models (logit SNR):
+      < 15 dB  — severe degradation, do not deploy
+      15-20 dB — degraded (noticeable accuracy drop)
+      20-30 dB — acceptable (small accuracy drop)
+      30-40 dB — good (target band for deployment)
+      > 40 dB  — excellent (no measurable degradation)
+
+    Args:
+        fp32_model: baseline FP32 model (eval mode).
+        int8_model: quantized INT8 model (eval mode).
+        loader: small DataLoader for SNR evaluation; does not need labels.
+        device: device for inference (typically `cpu` for INT8).
+        max_batches: cap on batches to bound runtime.
+
+    Returns:
+        Dict with `snr_db_logit`, `snr_db_softmax`, `signal_power`,
+        `noise_power`. Returns `inf` for snr when noise power is 0.
+    """
+    import math
+
+    fp32_model.eval()
+    int8_model.eval()
+
+    sig_powers: list[float] = []
+    noise_powers: list[float] = []
+    sig_softmax: list[float] = []
+    noise_softmax: list[float] = []
+    seen = 0
+
+    with torch.inference_mode():
+        for images, _ in loader:
+            if seen >= max_batches:
+                break
+            images = images.to(device)
+            fp32_out = fp32_model(images)
+            int8_out = int8_model(images)
+            diff = fp32_out - int8_out
+            sig_powers.append((fp32_out ** 2).mean().item())
+            noise_powers.append((diff ** 2).mean().item())
+            fp32_p = F.softmax(fp32_out, dim=1)
+            int8_p = F.softmax(int8_out, dim=1)
+            sig_softmax.append((fp32_p ** 2).mean().item())
+            noise_softmax.append(((fp32_p - int8_p) ** 2).mean().item())
+            seen += 1
+
+    if seen == 0:
+        raise ValueError("quantization_snr_db: loader produced 0 batches")
+
+    sig = sum(sig_powers) / seen
+    noise = sum(noise_powers) / seen
+    sig_s = sum(sig_softmax) / seen
+    noise_s = sum(noise_softmax) / seen
+
+    snr_logit = 10.0 * math.log10(max(sig / max(noise, 1e-12), 1e-12))
+    snr_softmax = 10.0 * math.log10(max(sig_s / max(noise_s, 1e-12), 1e-12))
+
+    return {
+        "snr_db_logit": snr_logit,
+        "snr_db_softmax": snr_softmax,
+        "signal_power_logit": sig,
+        "noise_power_logit": noise,
+    }
+

@@ -8,9 +8,9 @@ flowchart LR
     teacher["train_teacher<br/>EfficientNet-B3"]
     ft["finetune<br/>MobileNetV4"]
     distill["distill<br/>KL + CE"]
-    quant["quantize<br/>INT8 weight-only"]
+    quant["quantize<br/>full INT8 (snr in dB)"]
     bench["benchmark<br/>acc / latency / GFLOPs / size"]
-    exp["export<br/>TorchScript + torch.export"]
+    exp["export<br/>TorchScript + torch.export<br/>+ ONNX"]
 
     data --> teacher
     teacher -->|teacher_for_distill.pth| ft
@@ -19,7 +19,7 @@ flowchart LR
     distill -->|mobilenetv4_distilled.pth| quant
     quant -->|mobilenetv4_quantized.pth| bench
     bench --> exp
-    exp --> artifacts[("exported_models/<br/>mobilenetv4.pt<br/>mobilenetv4.pt2")] 
+    exp --> artifacts[("exported_models/<br/>mobilenetv4.pt<br/>mobilenetv4.pt2<br/>mobilenetv4.onnx")]
 ```
 
 Six Metaflow `@step`s. Each earlier step's checkpoint feeds the next, checkpoints are logged to MLflow as artifacts, and metrics are logged per-epoch.
@@ -89,21 +89,35 @@ flowchart LR
 - **CE on hard labels retained:** prevents the student from drifting away from true classes when teacher is imperfect.
 - **Why not feature-map distillation (FitNets / attention transfer):** feature matching adds hooks and projector heads; for a 3 M-param student + 12 M-param teacher, logit distillation already captures the bulk of the accuracy transfer at a fraction of the engineering cost.
 
-## 4. `quantize` — INT8 Weight-Only
+## 4. `quantize` — Full INT8 (Snapdragon AR1 NPU ready)
 
-**Purpose.** Make the student lightweight for deployment.
+**Purpose.** Make the student lightweight for the **Hexagon NPU** on Meta Ray-Ban's **Qualcomm Snapdragon AR1 Gen 1**. The NPU is INT8-only — FP16 inference falls back to the CPU (slow + power-hungry), so full INT8 (activations + weights) is mandatory.
 
 **Behavior.**
 
-- Loads the distilled checkpoint on CPU.
-- Preferred path: `torchao.quantize_(model, int8_weight_only())` then saves `mobilenetv4_quantized.pth`.
-- Fallback path: `torch.quantization.quantize_dynamic({nn.Linear}, dtype=qint8)` if `torchao` isn't installed.
+- Loads the distilled checkpoint on CPU. Keeps a deep-copied FP32 reference for SNR scoring.
+- Applies one of these backends (`cfg["quantize"]["backend"]`):
+  - **`torchao_int8_dynamic_activation_int8_weight`** *(default)* — full INT8, dynamic activation quant at inference. No calibration data needed. The Hexagon NPU accepts this format.
+  - **`torchao_int8_weight_only`** *(legacy)* — size-only fallback. Smaller on disk but activations stay FP32; the NPU offloads them to the CPU, killing the latency budget.
+- After quantization, runs `quantization_snr_db()` on a small validation subset to compute **SNR in dB** vs the FP32 baseline and logs `snr_db_logit` / `snr_db_softmax` to MLflow.
+- Fallback if `torchao` isn't installed: `torch.quantization.quantize_dynamic({nn.Linear}, dtype=torch.qint8)`.
+
+**SNR target band (logit-level).**
+
+| SNR (dB)      | Verdict              | Action                                  |
+| ------------- | -------------------- | --------------------------------------- |
+| < 20          | WARN                 | Quantization is hurting accuracy — re-tune |
+| 20 → 40       | PASS                 | Acceptable to good — deploy             |
+| ≥ 40          | PASS (excellent)     | No measurable degradation               |
+
+> **Note.** SNR is scored on the **val** split (the same split the early-stop / best-checkpoint selector uses). Not a leakage (the model never trains on `val`), but it's slightly optimistic vs. test-set SNR. For an unbiased number before deployment, call `quantization_snr_db()` once more on the **test** loader.
 
 **Why this setup.**
 
-- **Weight-only INT8 over static PTQ:** no calibration dataset needed, no need to recompile for a specific backend, and activations stay FP32 so accuracy degradation is minimal.
-- **`torchao` over `torch.quantization`:** torchao preserves the module structure (still call-able as a normal `nn.Module`); the legacy dynamic-quantize path rewrites modules to `QuantizedLinear`, which complicates downstream `torch.export`.
-- **Why not FP16 / INT4:** FP16 halves size but doubles memory bandwidth on CPU edge devices; INT4 needs per-channel calibration and offers diminishing returns on a 3 M-param model.
+- **Full INT8 over weight-only:** the AR1 Hexagon NPU compiles INT8 ops only. Weight-only INT8 leaves activations in FP32, which the NPU rejects and falls back to the (small, power-limited) Kryo CPU — kills our latency budget.
+- **torchao over `torch.ao.quantization`:** torchao preserves the `nn.Module` graph (still call-able from Python and exportable to ONNX) and stays in step with current PyTorch releases. The legacy PyTorch dynamic path rewrites modules to `QuantizedLinear`, which breaks `torch.onnx.export`.
+- **Why not FP16:** FP16 inference still runs, but on the CPU on AR1; throughput is ~3-5× worse than NPU-bound INT8 and drains the glasses' small battery.
+- **Why not INT4 / GPTQ-style 4-bit:** the AR1 NPU does not have a stable INT4 fast path; the per-channel calibration cost outweighs the marginal size savings on a 3 M-param model.
 
 ## 5. `benchmark` — Accuracy, Latency, Size, FLOPs
 
@@ -117,21 +131,24 @@ flowchart LR
 - `latency_ms` (speed, on the actual `device`)
 - `model_size_mb` (deploy footprint)
 - `gflops` (compute envelope)
+- `snr_db_logit` (quantization fidelity vs FP32, see §4)
 
-## 6. `export` — TorchScript & `torch.export`
+## 6. `export` — TorchScript, `torch.export`, ONNX
 
-**Purpose.** Produce portable artifacts independent of the training repo.
+**Purpose.** Produce portable artifacts independent of the training repo, including the format the Qualcomm QNN compiler needs.
 
 **Behavior.**
 
 - `torch.jit.trace` → `mobilenetv4.pt`
 - `torch.export.export` → `mobilenetv4.pt2`
-- Both saved under `exported_models/` and logged to MLflow.
+- `torch.onnx.export` → `mobilenetv4.onnx` (gated by `cfg["export"]["onnx"]`, opset 17 by default; batch axis dynamic)
+- All three saved under `exported_models/` and logged to MLflow.
 
-**Why two formats.**
+**Why three formats.**
 
-- **TorchScript:** mature, runs on `libtorch` C++ and on PyTorch Mobile — broadest compatibility for older edge stacks.
-- **`torch.export`:** the modern ATen-graph format; future-proof for ExecuTorch / XNNPACK / Inductor. We don't ship a third `.pte` artifact here so the pipeline stays framework-light, but re-using `mobilenetv4.pt2` with `executorch` is a one-liner off-pipeline.
+- **TorchScript:** mature, runs on `libtorch` C++ and PyTorch Mobile — broadest compatibility for older edge stacks.
+- **`torch.export`:** the modern ATen-graph format; future-proof for ExecuTorch / XNNPACK / Inductor. `mobilenetv4.pt2` → `executorch` is a one-liner off-pipeline.
+- **ONNX:** the input the **Qualcomm AI Hub / QNN compiler** expects. ONNX → `qnn-model-compiler` → `.dlc` is the path to a hardware-deployable, NPU-bound model on Meta Ray-Ban's AR1.
 
 ## Common Choices Across Stages
 
@@ -139,3 +156,4 @@ flowchart LR
 - **Hydra configs** instead of argparse: layered overrides (`finetune.lr=…`, `@package _group_` per stage file) compose cleanly without copy-pasting defaults.
 - **Metaflow `@retry(times=2)` + `@resources(cpu/memory/gpu)`**: training steps retry on transient faults and declare compute needs explicitly — same code runs locally, on Kubernetes, or on AWS Batch.
 - **Determinism:** `torch.manual_seed(42)` at the top of each stage; v2 transforms are deterministic up to DataLoader worker shuffle.
+- **SNR (dB) gate** in `quantize`: every quantized checkpoint is graded against the FP32 baseline; the run aborts with a clear WARN if `snr_db_logit < 20`. Re-run with `--stage quantize` after seating a fresh dataset / activation quantizer if SNR drifts.

@@ -26,7 +26,16 @@ distill:
   alpha: 0.5
 
 quantize:
-  backend: torchao_int8_weight_only
+  # Full INT8 (weights + activations) — required for the Hexagon NPU on
+  # Meta Ray-Ban's Snapdragon AR1 Gen 1. See PIPELINE.md section 4.
+  backend: torchao_int8_dynamic_activation_int8_weight
+  snr:
+    batch_size: 8
+    batches: 16  # cap on calibration batches for SNR (dB) scoring
+
+export:
+  onnx: true    # ONNX is the input the Qualcomm QNN compiler expects
+  opset: 17
 
 benchmark:
   batch_size: 64
