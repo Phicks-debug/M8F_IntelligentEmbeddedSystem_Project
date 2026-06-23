@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 
 from src.core import (
     _live_mem_snapshot,
@@ -25,10 +27,209 @@ from src.core import (
     model_size_mb,
     quantization_snr_db,
     save_checkpoint,
+    save_resume_state,
     train_one_epoch,
+    try_load_resume_state,
 )
 from src.tracking import log_artifact, log_metrics, log_params
 from src.utils import get_device
+
+
+def _last_ckpt_path(best_path: Path) -> Path:
+    """Companion resume-state path for a given best ckpt.
+
+    `mobilenetv4_finetuned.pth` -> `mobilenetv4_finetuned.last.pth`.
+    Kept as a separate file so the best ckpt's filename (which downstream
+    stages like `run_distill` / `run_quantize` look up) is unchanged.
+    """
+    return best_path.with_name(best_path.stem + ".last" + best_path.suffix)
+
+
+def _try_resume(
+    best_path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+) -> tuple[int, float, int]:
+    """Load resume state if any. Returns ``(start_epoch, best_acc, stall)``.
+
+    A fresh start returns ``(0, 0.0, 0)``. On a successful resume, prints
+    a single line so the user can see where the loop will pick up.
+    """
+    last_path = _last_ckpt_path(best_path)
+    rs = try_load_resume_state(last_path, model, optimizer, scheduler)
+    if rs is None:
+        return 0, 0.0, 0
+    print(
+        f"  Resumed from epoch {rs.epoch + 1} "
+        f"(best_acc={rs.best_acc:.4f}, stall={rs.stall})"
+    )
+    return rs.epoch, rs.best_acc, rs.stall
+
+
+def _run_probe(
+    cfg: dict,
+    cfg_key: str,
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    *,
+    crit: nn.Module,
+    eval_crit: nn.Module,
+    freeze_predicate: Callable[[str], bool],
+    banner: str,
+    log_metric_key: str,
+    probe_epochs: int,
+    device: str,
+    mixed_precision: bool,
+) -> float:
+    """Phase A: head-only probe training shared by `run_train_teacher` and
+    `run_finetune`. Freezes params whose name does NOT satisfy
+    `freeze_predicate(name)`, builds `opt_probe` (AdamW on the trainable
+    subset) with `CrossEntropyLoss(label_smoothing)`, runs `probe_epochs`
+    of standard train/val on the probe loaders, and logs the best probe
+    val_acc. Returns the best probe val_acc.
+
+    Caller passes `probe_epochs` resolved from config (so the historical
+    asymmetry between the teacher default 5 and the student default 3 is
+    preserved).
+    """
+    for name, param in model.named_parameters():
+        if not freeze_predicate(name):
+            param.requires_grad_(False)
+
+    opt_probe = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg[cfg_key]["lr"],
+        weight_decay=cfg[cfg_key]["weight_decay"],
+    )
+
+    print(f"\n[{banner}]")
+    best_probe = 0.0
+    for epoch in range(1, probe_epochs + 1):
+        train_one_epoch(
+            model, train_loader, crit, opt_probe, epoch, device,
+            mixed_precision=mixed_precision,
+        )
+        _, val_acc = evaluate(
+            model, val_loader, eval_crit, device,
+            mixed_precision=mixed_precision,
+        )
+        print(f"  Probe epoch {epoch}: val_acc={val_acc:.4f}")
+        if val_acc > best_probe:
+            best_probe = val_acc
+    print(f"  Best probe val_acc: {best_probe:.4f}")
+    log_metrics({log_metric_key: best_probe})
+    return best_probe
+
+
+def _run_resumable_epoch_loop(
+    cfg: dict,
+    cfg_key: str,
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    crit: nn.Module,
+    eval_crit: nn.Module,
+    ckpt_path: Path,
+    mixed_precision: bool,
+    log_metric_key: str,
+    *,
+    teacher: Optional[nn.Module] = None,
+    distill_cfg: Optional[dict] = None,
+) -> tuple[float, float]:
+    """Resume-aware training loop shared by `run_train_teacher` Phase B,
+    `run_finetune` Phase B, and `run_distill`'s main loop.
+
+    Builds optimizer + scheduler from ``cfg[cfg_key]``, restores from the
+    ``*.last.pth`` companion if present, runs the per-epoch train -> memory
+    snapshot -> validate -> log -> save-best-and-resume -> early-stop body,
+    then loads the best ckpt and evaluates on the test split.
+
+    Returns ``(best_val_acc, test_acc)`` so the caller can log them with its
+    own prefix without leaking the helper's metric-naming convention.
+    """
+    device = model_device(model)
+    opt = optim.AdamW(
+        model.parameters(),
+        lr=cfg[cfg_key]["lr"],
+        weight_decay=cfg[cfg_key]["weight_decay"],
+    )
+    sched = build_scheduler(opt, cfg[cfg_key]["warmup"], cfg[cfg_key]["epochs"])
+    last_ckpt_path = _last_ckpt_path(ckpt_path)
+    start_epoch, best_acc, stall = _try_resume(ckpt_path, model, opt, sched)
+    patience = cfg.get("patience", 10)
+    target_epochs = cfg[cfg_key]["epochs"]
+
+    if start_epoch < target_epochs:
+        for epoch in range(start_epoch + 1, target_epochs + 1):
+            train_kwargs: dict = {}
+            if teacher is not None and distill_cfg is not None:
+                train_kwargs = {"teacher": teacher, "distill_cfg": distill_cfg}
+            train_one_epoch(
+                model,
+                train_loader,
+                crit,
+                opt,
+                epoch,
+                device,
+                mixed_precision=mixed_precision,
+                **train_kwargs,
+            )
+            snap = _live_mem_snapshot(device)
+            if snap:
+                print(f"  {snap}")
+            if sched is not None:
+                sched.step()
+            _, val_acc = evaluate(
+                model,
+                val_loader,
+                eval_crit,
+                device,
+                mixed_precision=mixed_precision,
+            )
+            print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
+            log_metrics({log_metric_key: val_acc}, step=epoch)
+
+            if val_acc > best_acc:
+                best_acc = val_acc
+                save_checkpoint(model, ckpt_path, epoch=epoch, val_acc=val_acc)
+                stall = 0
+                save_resume_state(
+                    last_ckpt_path, model, opt, sched, epoch, best_acc, stall
+                )
+            else:
+                stall += 1
+                save_resume_state(
+                    last_ckpt_path, model, opt, sched, epoch, best_acc, stall
+                )
+                if stall >= patience:
+                    print(f"  Early stop at epoch {epoch}")
+                    break
+    else:
+        print(
+            f"  Resume state already completed {start_epoch} of "
+            f"{target_epochs} epochs; skipping training loop."
+        )
+
+    if ckpt_path.exists():
+        load_checkpoint(ckpt_path, model, device)
+    _, test_acc = evaluate(
+        model,
+        test_loader,
+        eval_crit,
+        device,
+        mixed_precision=mixed_precision,
+    )
+    return best_acc, test_acc
+
+
+def model_device(model: nn.Module) -> str:
+    """Return ``model.device.type`` as a string — the form used by the rest
+    of the pipeline (`get_device(cfg.get("device", "auto"))` returns one).
+    """
+    return next(model.parameters()).device.type
 
 
 def run_train_teacher(cfg: dict) -> Path:
@@ -71,66 +272,42 @@ def run_train_teacher(cfg: dict) -> Path:
     ckpt_path = ckpt_dir / "teacher_for_distill.pth"
 
     # Phase A: Probe
-    print("\n[TEACHER PROBE] Training classifier head only")
-    for name, param in model.named_parameters():
-        if "classifier" not in name:
-            param.requires_grad_(False)
-
-    opt_probe = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg["finetune"]["lr"],
-        weight_decay=cfg["finetune"]["weight_decay"],
-    )
     crit = nn.CrossEntropyLoss(label_smoothing=cfg["finetune"].get("smoothing", 0.0))
     eval_crit = nn.CrossEntropyLoss()
-
-    best_probe = 0.0
-    probe_epochs = cfg["finetune"].get("probe_epochs", 5)
-    for epoch in range(1, probe_epochs + 1):
-        train_one_epoch(
-            model, train_probe, crit, opt_probe, epoch, device, mixed_precision=mp
-        )
-        _, val_acc = evaluate(model, val_probe, eval_crit, device, mixed_precision=mp)
-        print(f"  Probe epoch {epoch}: val_acc={val_acc:.4f}")
-        if val_acc > best_probe:
-            best_probe = val_acc
-    print(f"  Best probe val_acc: {best_probe:.4f}")
-    log_metrics({"teacher_probe_val_acc": best_probe})
+    _run_probe(
+        cfg=cfg,
+        cfg_key="finetune",
+        model=model,
+        train_loader=train_probe,
+        val_loader=val_probe,
+        crit=crit,
+        eval_crit=eval_crit,
+        freeze_predicate=lambda name: "classifier" in name,
+        banner="TEACHER PROBE",
+        log_metric_key="teacher_probe_val_acc",
+        probe_epochs=cfg["finetune"].get("probe_epochs", 5),
+        device=device,
+        mixed_precision=mp,
+    )
 
     # Phase B: Full fine-tune
     print("\n[TEACHER FULL] Fine-tuning all parameters")
     for param in model.parameters():
         param.requires_grad_(True)
 
-    opt = optim.AdamW(
-        model.parameters(),
-        lr=cfg["finetune"]["lr"],
-        weight_decay=cfg["finetune"]["weight_decay"],
+    best_acc, test_acc = _run_resumable_epoch_loop(
+        cfg=cfg,
+        cfg_key="finetune",
+        model=model,
+        train_loader=train_full,
+        val_loader=val_full,
+        test_loader=test_full,
+        crit=crit,
+        eval_crit=eval_crit,
+        ckpt_path=ckpt_path,
+        mixed_precision=mp,
+        log_metric_key="teacher_val_acc",
     )
-    sched = build_scheduler(opt, cfg["finetune"]["warmup"], cfg["finetune"]["epochs"])
-
-    best_acc, stall = 0.0, 0
-    for epoch in range(1, cfg["finetune"]["epochs"] + 1):
-        train_one_epoch(model, train_full, crit, opt, epoch, device, mixed_precision=mp)
-        if sched is not None:
-            sched.step()
-        _, val_acc = evaluate(model, val_full, eval_crit, device, mixed_precision=mp)
-        print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
-        log_metrics({"teacher_val_acc": val_acc}, step=epoch)
-
-        if val_acc > best_acc:
-            best_acc = val_acc
-            save_checkpoint(model, ckpt_path, epoch=epoch, val_acc=val_acc)
-            stall = 0
-        else:
-            stall += 1
-            if stall >= cfg.get("patience", 10):
-                print(f"  Early stop at epoch {epoch}")
-                break
-
-    if ckpt_path.exists():
-        load_checkpoint(ckpt_path, model, device)
-    _, test_acc = evaluate(model, test_full, eval_crit, device, mixed_precision=mp)
     print(f"  Teacher test_acc: {test_acc:.4f}")
     log_metrics({"teacher_test_acc": test_acc, "teacher_best_val_acc": best_acc})
     log_artifact(ckpt_path)
@@ -178,69 +355,42 @@ def run_finetune(cfg: dict) -> Path:
     ckpt_path = ckpt_dir / "mobilenetv4_finetuned.pth"
 
     # Phase A: Probe
-    print("\n[PROBE] Training classifier head only")
-    for name, param in model.named_parameters():
-        if "head" not in name and "classifier" not in name:
-            param.requires_grad_(False)
-
-    opt_probe = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg["finetune"]["lr"],
-        weight_decay=cfg["finetune"]["weight_decay"],
-    )
     crit = nn.CrossEntropyLoss(label_smoothing=cfg["finetune"].get("smoothing", 0.0))
     eval_crit = nn.CrossEntropyLoss()
-
-    best_probe = 0.0
-    probe_epochs = cfg["finetune"].get("probe_epochs", 3)
-    for epoch in range(1, probe_epochs + 1):
-        train_one_epoch(
-            model, train_probe, crit, opt_probe, epoch, device, mixed_precision=mp
-        )
-        _, val_acc = evaluate(model, val_probe, eval_crit, device, mixed_precision=mp)
-        print(f"  Probe epoch {epoch}: val_acc={val_acc:.4f}")
-        if val_acc > best_probe:
-            best_probe = val_acc
-    print(f"  Best probe val_acc: {best_probe:.4f}")
-    log_metrics({"probe_val_acc": best_probe})
+    _run_probe(
+        cfg=cfg,
+        cfg_key="finetune",
+        model=model,
+        train_loader=train_probe,
+        val_loader=val_probe,
+        crit=crit,
+        eval_crit=eval_crit,
+        freeze_predicate=lambda name: "head" in name or "classifier" in name,
+        banner="PROBE",
+        log_metric_key="probe_val_acc",
+        probe_epochs=cfg["finetune"].get("probe_epochs", 3),
+        device=device,
+        mixed_precision=mp,
+    )
 
     # Phase B: Full fine-tune
     print("\n[FULL] Fine-tuning all parameters")
     for param in model.parameters():
         param.requires_grad_(True)
 
-    opt = optim.AdamW(
-        model.parameters(),
-        lr=cfg["finetune"]["lr"],
-        weight_decay=cfg["finetune"]["weight_decay"],
+    best_acc, test_acc = _run_resumable_epoch_loop(
+        cfg=cfg,
+        cfg_key="finetune",
+        model=model,
+        train_loader=train_full,
+        val_loader=val_full,
+        test_loader=test_full,
+        crit=crit,
+        eval_crit=eval_crit,
+        ckpt_path=ckpt_path,
+        mixed_precision=mp,
+        log_metric_key="finetune_val_acc",
     )
-    sched = build_scheduler(opt, cfg["finetune"]["warmup"], cfg["finetune"]["epochs"])
-
-    best_acc, stall = 0.0, 0
-    for epoch in range(1, cfg["finetune"]["epochs"] + 1):
-        train_one_epoch(model, train_full, crit, opt, epoch, device, mixed_precision=mp)
-        snap = _live_mem_snapshot(device)
-        if snap:
-            print(f"  {snap}")
-        if sched is not None:
-            sched.step()
-        _, val_acc = evaluate(model, val_full, eval_crit, device, mixed_precision=mp)
-        print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
-        log_metrics({"finetune_val_acc": val_acc}, step=epoch)
-
-        if val_acc > best_acc:
-            best_acc = val_acc
-            save_checkpoint(model, ckpt_path, epoch=epoch, val_acc=val_acc)
-            stall = 0
-        else:
-            stall += 1
-            if stall >= cfg.get("patience", 10):
-                print(f"  Early stop at epoch {epoch}")
-                break
-
-    if ckpt_path.exists():
-        load_checkpoint(ckpt_path, model, device)
-    _, test_acc = evaluate(model, test_full, eval_crit, device, mixed_precision=mp)
     print(f"  Student test_acc: {test_acc:.4f}")
     log_metrics({"finetune_test_acc": test_acc, "finetune_best_val_acc": best_acc})
     log_artifact(ckpt_path)
@@ -297,7 +447,7 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
         lr=cfg["distill"]["lr"],
         weight_decay=cfg["distill"]["weight_decay"],
     )
-    sched = build_scheduler(opt, cfg["distill"]["warmup"], cfg["distill"]["epochs"])
+    build_scheduler(opt, cfg["distill"]["warmup"], cfg["distill"]["epochs"])
     crit = nn.CrossEntropyLoss(label_smoothing=cfg["finetune"].get("smoothing", 0.0))
     eval_crit = nn.CrossEntropyLoss()
 
@@ -307,40 +457,21 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / "mobilenetv4_distilled.pth"
 
-    best_acc, stall = 0.0, 0
-    for epoch in range(1, cfg["distill"]["epochs"] + 1):
-        train_one_epoch(
-            student,
-            train,
-            crit,
-            opt,
-            epoch,
-            device,
-            teacher=teacher,
-            distill_cfg=distill_cfg,
-        )
-        snap = _live_mem_snapshot(device)
-        if snap:
-            print(f"  {snap}")
-        if sched is not None:
-            sched.step()
-        _, val_acc = evaluate(student, val, eval_crit, device, mixed_precision=mp)
-        print(f"  Epoch {epoch}: val_acc={val_acc:.4f}")
-        log_metrics({"distill_val_acc": val_acc}, step=epoch)
-
-        if val_acc > best_acc:
-            best_acc = val_acc
-            save_checkpoint(student, ckpt_path, epoch=epoch, val_acc=val_acc)
-            stall = 0
-        else:
-            stall += 1
-            if stall >= cfg.get("patience", 10):
-                print(f"  Early stop at epoch {epoch}")
-                break
-
-    if ckpt_path.exists():
-        load_checkpoint(ckpt_path, student, device)
-    _, test_acc = evaluate(student, test, eval_crit, device, mixed_precision=mp)
+    best_acc, test_acc = _run_resumable_epoch_loop(
+        cfg=cfg,
+        cfg_key="distill",
+        model=student,
+        train_loader=train,
+        val_loader=val,
+        test_loader=test,
+        crit=crit,
+        eval_crit=eval_crit,
+        ckpt_path=ckpt_path,
+        mixed_precision=mp,
+        log_metric_key="distill_val_acc",
+        teacher=teacher,
+        distill_cfg=distill_cfg,
+    )
     print(f"  Distilled test_acc: {test_acc:.4f}")
     log_metrics({"distill_test_acc": test_acc, "distill_best_val_acc": best_acc})
     log_artifact(ckpt_path)

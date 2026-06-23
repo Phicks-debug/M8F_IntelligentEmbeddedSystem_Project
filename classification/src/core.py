@@ -4,11 +4,15 @@ Core utilities: data loading, model creation, metrics, and training primitives.
 
 from __future__ import annotations
 
+import os
+import random
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +22,15 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import v2
 from tqdm import tqdm
+
+
+@dataclass
+class ResumedState:
+    """Carries the bookkeeping restored from a resume-state file."""
+
+    epoch: int
+    best_acc: float
+    stall: int
 
 
 def _amp_ctx(device: str, enabled: bool):
@@ -70,6 +83,77 @@ def _live_mem_snapshot(device: str, threshold: float = 0.8) -> Optional[str]:
             "consider dropping finetune.batch_size / distill.batch_size"
         )
     return line
+
+
+def save_resume_state(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    epoch: int,
+    best_acc: float,
+    stall: int,
+) -> None:
+    """Persist a *resume-state* file capturing model + optimizer + scheduler
+    state plus the looping bookkeeping, so a crash mid-stage is recoverable.
+
+    Captures: model.state_dict, optimizer.state_dict, scheduler.state_dict
+    (when not None), torch + python.random + numpy RNG state, plus epoch,
+    best_acc, stall. Atomic write (`<path>.tmp` then `os.replace`) so a
+    crash during write never leaves a half-truncated file observable.
+
+    Pair with `try_load_resume_state`. The companion "best" ckpt saved by
+    `save_checkpoint` is left untouched so downstream stages see the same
+    filename.
+    """
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "rng_torch": torch.get_rng_state().cpu(),
+        "rng_python": random.getstate(),
+        "rng_numpy": np.random.get_state(),
+        "epoch": int(epoch),
+        "best_acc": float(best_acc),
+        "stall": int(stall),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def try_load_resume_state(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+) -> Optional[ResumedState]:
+    """Restore state from a resume-state file.
+
+    Returns ``None`` if the file is missing or unreadable (corrupt, wrong
+    shape, primitive failure); prints a single ``[WARN]`` line on a soft
+    failure so the user can decide whether to delete the bad file.
+    """
+    if not path.exists():
+        return None
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        if scheduler is not None and state.get("scheduler") is not None:
+            scheduler.load_state_dict(state["scheduler"])
+        torch.set_rng_state(state["rng_torch"])
+        random.setstate(state["rng_python"])
+        np.random.set_state(state["rng_numpy"])
+        return ResumedState(
+            epoch=int(state["epoch"]),
+            best_acc=float(state["best_acc"]),
+            stall=int(state["stall"]),
+        )
+    except (RuntimeError, ValueError, KeyError, AttributeError, EOFError) as exc:
+        print(f"[WARN] Could not load resume state from {path}: {exc}; starting fresh.")
+        return None
 
 
 def build_transforms(image_size: int, is_train: bool) -> v2.Compose:

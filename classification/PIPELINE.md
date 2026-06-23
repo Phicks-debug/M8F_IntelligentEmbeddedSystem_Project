@@ -181,3 +181,17 @@ If the WARN never fires over 1-2 epochs, the full run will fit.
 - **Metaflow `@retry(times=2)` + `@resources(cpu/memory/gpu)`**: training steps retry on transient faults and declare compute needs explicitly — same code runs locally, on Kubernetes, or on AWS Batch.
 - **Determinism:** `torch.manual_seed(42)` at the top of each stage; v2 transforms are deterministic up to DataLoader worker shuffle.
 - **SNR (dB) gate** in `quantize`: every quantized checkpoint is graded against the FP32 baseline; the run aborts with a clear WARN if `snr_db_logit < 20`. Re-run with `--stage quantize` after seating a fresh dataset / activation quantizer if SNR drifts.
+
+## Intra-Stage Resume from Crash
+
+`run_train_teacher`, `run_finetune`, and `run_distill` write a **`*.last.pth`** companion file every epoch, distinct from the **`*.pth`** best-ckpt that downstream stages consume. Each `*.last.pth` carries enough state to pick a crashed loop up at the start of the next epoch:
+
+- `model.state_dict()`, `optimizer.state_dict()`, `scheduler.state_dict()` — restores AdamW momentum and the cosine LR position.
+- `torch` + `python.random` + `numpy` RNG state — shuffle order is reproducible across the resume boundary.
+- `epoch`, `best_acc`, `stall` — preserves the early-stop counter so e.g. `stall=9` after a crash continues into the patience check cleanly.
+
+Atomic writes via `.tmp` + `os.replace` mean a crash mid-write never leaves a half-truncated file observable.
+
+At startup, each runner calls `_try_resume(best_path, ...)` which returns `(start_epoch, best_acc, stall)`. On a fresh start that is `(0, 0.0, 0)`; on a resumed run the runner prints `Resumed from epoch 12 (best_acc=0.9134, stall=2)` and continues the loop from `epoch=start_epoch + 1` — **not** from epoch 1. If the resume state's `epoch` already met or exceeded `cfg[stage]["epochs"]` (e.g. the run completed before the crash happened to hit later), the training loop is skipped and the runner goes straight to the existing best-ckpt + `evaluate(test)` tail.
+
+To force a fresh start after a botched resume, delete the `*.last.pth` companion for that stage (`rm checkpoints/mobilenetv4_finetuned.last.pth`); the `*.pth` best is untouched and downstream stages (`run_distill`, `run_quantize`, ...) still find it by filename.
