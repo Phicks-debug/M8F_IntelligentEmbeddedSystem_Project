@@ -23,6 +23,7 @@ IMAGE_SIZE = 224  # size fed to the model, after center crop
 RESIZE = 256  # shorter side is scaled to this before cropping
 
 # ImageNet normalization stats the model was trained with (per RGB channel).
+# They are standard ImageNet statistics, duplicate from the training pipeline
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
