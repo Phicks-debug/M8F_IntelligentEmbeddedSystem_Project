@@ -54,14 +54,19 @@ export:
   onnx: true # FP32 intermediate ONNX
   int8_onnx: true # final Ray-Ban NPU deployment ONNX (QDQ INT8)
   opset: 18
-  # Compile FP32 ONNX to Hailo Executable Format (.hef) for Hailo-8 / Hailo-8L
-  # NPUs. Skipped automatically when the Hailo Dataflow Compiler SDK is not
-  # installed; set `require: true` to fail the export instead. The compiler
-  # performs its own quantization so we feed FP32 (not the INT8 QDQ ONNX).
+  # Compile FP32 ONNX to Hailo Executable Format (.hef) for the Raspberry Pi 5
+  # + Hailo HAT+ (Hailo-10H). Compilation runs on an x86 Linux host with the
+  # Hailo Dataflow Compiler 5.3.0 SDK; it is NOT installable on macOS/this box.
+  # The compiler performs its OWN INT8 quantization, so we feed the FP32 ONNX
+  # (NOT the INT8 QDQ ONNX). See docs/hailo_deployment.md for the full flow.
   hailo:
     enabled: true
-    hw_arch: hailo8 # 'hailo8' (26 TOPS) or 'hailo8l' (13 TOPS)
+    hw_arch: hailo10h # MUST be hailo10h for the Pi 5 HAT+; a hailo8/hailo8l
+                      # HEF will not load on the Hailo-10H runtime.
     require: false # Raise when SDK missing or compilation fails
+    # Calibration data MUST be in the model's input space. This ONNX has no
+    # preprocessing baked in, so calibration is ImageNet-normalized NHWC
+    # (NOT the lab's [0,1] capture). classification/hailo/build_calib.py builds it.
     calibration:
       split: val # 'train' | 'val' | 'test'
       batch_size: 8

@@ -560,10 +560,6 @@ def run_distill(cfg: dict, student_ckpt: Path) -> Path:
     return ckpt_path
 
 
-def _size_mb(path: Path) -> float:
-    return path.stat().st_size / (1024 * 1024)
-
-
 def _quantize_backend(cfg: dict, checkpoint_path: Optional[Path] = None) -> str:
     if checkpoint_path is not None and "quantized" in checkpoint_path.stem:
         if checkpoint_path.exists():
@@ -999,7 +995,7 @@ def _benchmark_onnx_model(
         _run_onnx_session(session, first_batch)
     latency_ms = ((time.perf_counter() - start) / max_latency_runs) * 1000.0
 
-    size_mb = _size_mb(path)
+    size_mb = model_size_mb(path)
     gops = _estimate_onnx_gops(path)
     effective_tops = (gops / latency_ms) if latency_ms > 0 else 0.0
     return {
@@ -1327,7 +1323,7 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
     )
     load_checkpoint(checkpoint_path, model, device)
 
-    original_mb = _size_mb(checkpoint_path)
+    original_mb = model_size_mb(checkpoint_path)
     ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
     out_path = ckpt_dir / "mobilenetv4_quantized.pth"
 
@@ -1388,7 +1384,7 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
             backend=backend_used,
             calibration=quantization_metadata,
         )
-        quantized_mb = _size_mb(out_path)
+        quantized_mb = model_size_mb(out_path)
         saved_mb = original_mb - quantized_mb
         saved_pct = (saved_mb / original_mb * 100) if original_mb else 0.0
         print(f"Quantized model saved to {out_path}")
@@ -1459,7 +1455,7 @@ def run_quantize(cfg: dict, checkpoint_path: Path) -> Path:
         log_metrics(
             {
                 "original_size_mb": original_mb,
-                "quantized_size_mb": _size_mb(out_path),
+                "quantized_size_mb": model_size_mb(out_path),
             }
         )
 
@@ -1639,7 +1635,7 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     model, _ = _make_student_for_checkpoint(cfg, checkpoint_path, device)
     print(f"Loaded checkpoint from {checkpoint_path}")
-    print(f"  Source checkpoint size: {_size_mb(checkpoint_path):.2f} MB")
+    print(f"  Source checkpoint size: {model_size_mb(checkpoint_path):.2f} MB")
 
     export_dir = Path(cfg["paths"]["export_dir"])
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -1653,7 +1649,7 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
         ts_path = export_dir / "mobilenetv4.pt"
         traced.save(str(ts_path))  # type: ignore
         print(f"TorchScript -> {ts_path}")
-        print(f"  TorchScript size: {_size_mb(ts_path):.2f} MB")
+        print(f"  TorchScript size: {model_size_mb(ts_path):.2f} MB")
         results["torchscript"] = str(ts_path)
         log_artifact(ts_path)
     except Exception as e:
@@ -1665,7 +1661,7 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
         ep_path = export_dir / "mobilenetv4.pt2"
         torch.export.save(ep, ep_path)  # type: ignore[arg-type]
         print(f"torch.export -> {ep_path}")
-        print(f"  torch.export size: {_size_mb(ep_path):.2f} MB")
+        print(f"  torch.export size: {model_size_mb(ep_path):.2f} MB")
         results["torch_export"] = str(ep_path)
         log_artifact(ep_path)
     except Exception as e:
@@ -1696,7 +1692,7 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
             )
             print(f"ONNX -> {onnx_path}")
             print(f"  ONNX source checkpoint: {onnx_checkpoint}")
-            print(f"  ONNX size: {_size_mb(onnx_path):.2f} MB")
+            print(f"  ONNX size: {model_size_mb(onnx_path):.2f} MB")
             results["onnx"] = str(onnx_path)
             results["onnx_source_checkpoint"] = str(onnx_checkpoint)
             log_artifact(onnx_path)
@@ -1705,7 +1701,7 @@ def run_export(cfg: dict, checkpoint_path: Path) -> dict:
                 int8_onnx_path = export_dir / "mobilenetv4_int8.onnx"
                 if _export_calibrated_int8_onnx(cfg, onnx_path, int8_onnx_path):
                     print(f"INT8 ONNX -> {int8_onnx_path}")
-                    print(f"  INT8 ONNX size: {_size_mb(int8_onnx_path):.2f} MB")
+                    print(f"  INT8 ONNX size: {model_size_mb(int8_onnx_path):.2f} MB")
                     results["int8_onnx"] = str(int8_onnx_path)
                     results["deployment_onnx"] = str(int8_onnx_path)
                     results["deployment_precision"] = "int8_qdq"

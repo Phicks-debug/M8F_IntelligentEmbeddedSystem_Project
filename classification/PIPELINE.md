@@ -28,15 +28,21 @@ Stages:
 - `export`: creates FP32 ONNX, calibrated INT8 QDQ ONNX, and validates ONNX metrics.
 - `report`: writes comparison JSON, benchmark diagram, and `classification_report.md`.
 
-## Deployment Artifact
+## Deployment Artifacts
 
-Use this file for Ray-Ban NPU deployment:
+The right artifact depends on the target NPU — they are **not** interchangeable:
 
-```text
-exported_models/mobilenetv4_int8.onnx
-```
+| Target | Artifact | Why |
+| --- | --- | --- |
+| **Ray-Ban** (Snapdragon AR1, Hexagon NPU) | `exported_models/mobilenetv4_int8.onnx` | Runs the calibrated QDQ INT8 graph directly. |
+| **Raspberry Pi 5 + HAT+** (Hailo-10H) | `exported_models/mobilenetv4.onnx` (FP32) | The Hailo compiler does its **own** int8 quantization, so it needs the FP32 graph. Feeding the QDQ ONNX = double quantization. |
 
-It is a calibrated QDQ INT8 ONNX model. `exported_models/mobilenetv4.onnx` is only the FP32 intermediate used to build the INT8 export.
+`exported_models/mobilenetv4.onnx` is the FP32 intermediate used to build the
+INT8 QDQ export **and** the input to the Hailo compiler.
+
+For the full Hailo flow (why FP32, why rebuild calibration, and the three-step
+accuracy retest), see [../docs/hailo_deployment.md](../docs/hailo_deployment.md).
+Scripts: [hailo/](hailo/).
 
 ## Outputs
 

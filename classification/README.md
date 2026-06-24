@@ -1,6 +1,22 @@
 # Classification Pipeline
 
-Training pipeline for the Ray-Ban classification model. It trains a teacher, fine-tunes a MobileNetV4 student, distills, calibrates INT8 quantization, benchmarks, reports, and exports deployment artifacts.
+Training pipeline for the Ray-Ban classification model.
+
+```mermaid
+flowchart LR
+    data["ImageFolder data<br/>train / val / test"]
+    teacher["teacher<br/>EfficientNet-B3"]
+    student["finetune<br/>MobileNetV4"]
+    distill["distill<br/>teacher -> student"]
+    quant["quantize<br/>calibrated PyTorch INT8"]
+    bench["benchmark<br/>test metrics + diagrams"]
+    export["export<br/>FP32 ONNX -> INT8 QDQ ONNX"]
+    report["report<br/>comparison + markdown"]
+
+    data --> teacher --> student --> distill --> quant --> bench --> export --> report
+```
+
+It trains a teacher, fine-tunes a MobileNetV4 student, distills, calibrates INT8 quantization, benchmarks, reports, and exports deployment artifacts.
 
 ## Data Format
 

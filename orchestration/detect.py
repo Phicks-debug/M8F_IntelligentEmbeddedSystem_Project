@@ -31,7 +31,7 @@ def detect(image_path, model_path, threshold=0.25):
 
     session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
-    output = session.run(None, {input_name: batch})[0]
+    output = np.asarray(session.run(None, {input_name: batch})[0])
 
     results = []
     for row in output[0]:

@@ -27,17 +27,6 @@ def get_device(preferred: str = "auto") -> str:
     return "cpu"
 
 
-def checkpoint_to_bytes(path: Path) -> bytes:
-    """Read a checkpoint file into bytes for Metaflow artifact passing."""
-    return path.read_bytes()
-
-
-def bytes_to_checkpoint(data: bytes, path: Path) -> None:
-    """Write checkpoint bytes to disk."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-
-
 def is_remote_uri(value: str | Path | None) -> bool:
     """Return True for object-store URIs handled through fsspec."""
     if value is None:
