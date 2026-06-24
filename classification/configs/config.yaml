@@ -54,6 +54,18 @@ export:
   onnx: true # FP32 intermediate ONNX
   int8_onnx: true # final Ray-Ban NPU deployment ONNX (QDQ INT8)
   opset: 18
+  # Compile FP32 ONNX to Hailo Executable Format (.hef) for Hailo-8 / Hailo-8L
+  # NPUs. Skipped automatically when the Hailo Dataflow Compiler SDK is not
+  # installed; set `require: true` to fail the export instead. The compiler
+  # performs its own quantization so we feed FP32 (not the INT8 QDQ ONNX).
+  hailo:
+    enabled: true
+    hw_arch: hailo8 # 'hailo8' (26 TOPS) or 'hailo8l' (13 TOPS)
+    require: false # Raise when SDK missing or compilation fails
+    calibration:
+      split: val # 'train' | 'val' | 'test'
+      batch_size: 8
+      batches: 32
 
 benchmark:
   batch_size: 64  # inference-only (no backward, no optimizer state), so 64 is safe and amortizes launch overhead
