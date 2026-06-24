@@ -40,21 +40,22 @@ def load_torchscript_model(model_path: Path, device: str = "cpu") -> torch.nn.Mo
 
 
 @torch.inference_mode()
-def predict_image(
-    image_path: Path,
+def predict_pil_image(
+    image: Image.Image,
     model: torch.nn.Module,
     class_names: list[str],
     *,
+    image_label: str,
     image_size: int = 224,
     device: str = "cpu",
     topk: int = 3,
 ) -> dict[str, Any]:
-    """Predict species and edibility for one image."""
+    """Predict species and edibility for one loaded PIL image."""
 
     validate_edibility_map(class_names)
 
     transform = build_transforms(image_size, is_train=False)
-    image = Image.open(image_path).convert("RGB")
+    image = image.convert("RGB")
     batch = transform(image).unsqueeze(0).to(device)
 
     model = model.to(device)
@@ -79,12 +80,36 @@ def predict_image(
         )
 
     result = {
-        "image": str(image_path),
+        "image": image_label,
         "top_prediction": predictions[0],
         "topk": predictions,
         "safety_warning": SAFETY_WARNING,
     }
     return result
+
+
+@torch.inference_mode()
+def predict_image(
+    image_path: Path,
+    model: torch.nn.Module,
+    class_names: list[str],
+    *,
+    image_size: int = 224,
+    device: str = "cpu",
+    topk: int = 3,
+) -> dict[str, Any]:
+    """Predict species and edibility for one image path."""
+
+    image = Image.open(image_path).convert("RGB")
+    return predict_pil_image(
+        image,
+        model,
+        class_names,
+        image_label=str(image_path),
+        image_size=image_size,
+        device=device,
+        topk=topk,
+    )
 
 
 def format_prediction(result: dict[str, Any], *, min_candidate_confidence: float = 0.01) -> str:
