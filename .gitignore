@@ -235,6 +235,7 @@ metadata/
 runs/
 checkpoints/
 exported_models/
+outputs/
 
 # Hailo generated artifacts (calibration/test .npy files can exceed 100 MB)
 classification/hailo/artifacts/*.npy

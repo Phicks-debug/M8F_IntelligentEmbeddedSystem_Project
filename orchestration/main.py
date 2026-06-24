@@ -3,15 +3,29 @@ import json
 from pathlib import Path
 
 from orchestration.classify import class_names, classify
-from orchestration.detect import crop, detect
+from orchestration.detect import crop, detect, save_boxes
 from orchestration.edibility import SAFETY_WARNING
 
 
-def run(image_path, detector_path, classifier_path, data_dir, threshold, padding, device, topk):
+def run(
+    image_path,
+    detector_path,
+    classifier_path,
+    data_dir,
+    threshold,
+    padding,
+    device,
+    topk,
+    save_detection=None,
+):
     detections = detect(image_path, detector_path, threshold)
+    if save_detection:
+        save_boxes(image_path, detections, save_detection)
+
     if not detections:
         return {
             "image": str(image_path),
+            "detection_image": str(save_detection) if save_detection else None,
             "detection": None,
             "classification": None,
             "message": "No mushroom detection passed the confidence threshold.",
@@ -29,6 +43,7 @@ def run(image_path, detector_path, classifier_path, data_dir, threshold, padding
     )
     return {
         "image": str(image_path),
+        "detection_image": str(save_detection) if save_detection else None,
         "detection": best,
         "num_detections": len(detections),
         "classification": predictions,
@@ -38,24 +53,36 @@ def run(image_path, detector_path, classifier_path, data_dir, threshold, padding
 
 def format_output(result):
     if result["detection"] is None:
+        lines = [
+            "Detection: no mushroom found",
+            result["message"],
+            f"Detection image: {result['detection_image']}"
+            if result["detection_image"]
+            else "",
+            result["safety_warning"],
+        ]
         return "\n".join(
-            [
-                "Detection: no mushroom found",
-                result["message"],
-                result["safety_warning"],
-            ]
+            line
+            for line in lines
+            if line
         )
 
     detection = result["detection"]
     best = result["classification"][0]
+    lines = [
+        f"Detection: mushroom ({detection['confidence'] * 100:.2f}%)",
+        f"Detection image: {result['detection_image']}"
+        if result["detection_image"]
+        else "",
+        f"Species: {best['name']} ({best['confidence'] * 100:.2f}%)",
+        f"Edibility: {best['edibility']}",
+        f"Note: {best['note']}",
+        result["safety_warning"],
+    ]
     return "\n".join(
-        [
-            f"Detection: mushroom ({detection['confidence'] * 100:.2f}%)",
-            f"Species: {best['name']} ({best['confidence'] * 100:.2f}%)",
-            f"Edibility: {best['edibility']}",
-            f"Note: {best['note']}",
-            result["safety_warning"],
-        ]
+        line
+        for line in lines
+        if line
     )
 
 
@@ -71,10 +98,11 @@ def main():
         type=Path,
         default=Path("data/processed/classification_data"),
     )
-    parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--threshold", type=float, default=0.60)
     parser.add_argument("--padding", type=float, default=0.08)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--topk", type=int, default=3)
+    parser.add_argument("--save-detection", type=Path)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -87,6 +115,7 @@ def main():
         args.padding,
         args.device,
         args.topk,
+        args.save_detection,
     )
 
     if args.json:
