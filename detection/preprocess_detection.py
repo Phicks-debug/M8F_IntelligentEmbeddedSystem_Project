@@ -1,14 +1,17 @@
 import os
 import random
 import shutil
+from pathlib import Path
 
-root = r"C:\Users\jules\Documents\prog\M8F_IntelligentEmbeddedSystem_Project\detection\data\raw"
+SCRIPT_DIR = Path(__file__).resolve().parent
+RAW_DIR = SCRIPT_DIR / "data" / "raw"
+OUTPUT_DIR = SCRIPT_DIR / "data"
 
 # Datasets
-bark_path = os.path.join(root, "tree-bark")
-mushroom_path = os.path.join(root, "mushroom")
-flowers_path = os.path.join(root, "flowers")
-lumber_path = os.path.join(root, "timber")
+bark_path = RAW_DIR / "tree-bark"
+mushroom_path = RAW_DIR / "mushroom"
+flowers_path = RAW_DIR / "flowers"
+lumber_path = RAW_DIR / "timber"
 
 image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}
 
@@ -34,18 +37,10 @@ for dataset_path, image_list in dataset_lists.items():
 print("dirs")
 
 # make directories
-root = "C:\\Users\\jules\\Documents\\prog\\M8F_IntelligentEmbeddedSystem_Project\\detection\\data"
-
-os.makedirs(os.path.join(root, "train"), exist_ok=True)
-os.makedirs(os.path.join(root, "val"), exist_ok=True)
-os.makedirs(os.path.join(root, "test"), exist_ok=True)
-
-os.makedirs(os.path.join(root, "train", "no-mushroom"), exist_ok=True)
-os.makedirs(os.path.join(root, "train", "mushroom"), exist_ok=True)
-os.makedirs(os.path.join(root, "val", "no-mushroom"), exist_ok=True)
-os.makedirs(os.path.join(root, "val", "mushroom"), exist_ok=True)
-os.makedirs(os.path.join(root, "test", "no-mushroom"), exist_ok=True)
-os.makedirs(os.path.join(root, "test", "mushroom"), exist_ok=True)
+for split in ["train", "val", "test"]:
+    (OUTPUT_DIR / split).mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / split / "no-mushroom").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / split / "mushroom").mkdir(parents=True, exist_ok=True)
 
 
 print("division")
@@ -57,33 +52,20 @@ for dataset_path, image_list in dataset_lists.items():
     random.shuffle(image_list)
     train_size = int(0.8 * len(image_list))
     val_size = int(0.10 * len(image_list))
-    test_size = len(image_list) - train_size - val_size
 
     train_images = image_list[:train_size]
     val_images = image_list[train_size:train_size + val_size]
-    test_images = image_list[train_size + val_size:train_size + val_size + test_size]
+    test_images = image_list[train_size + val_size:]
 
     # Copy images to respective directories
     for img in train_images:
-        if dataset_path != mushroom_path:
-            os.makedirs(os.path.join(root, "train", "no-mushroom"), exist_ok=True)
-            shutil.copy(img, os.path.join(root, "train", "no-mushroom"))
-        else:
-            os.makedirs(os.path.join(root, "train", "mushroom"), exist_ok=True)
-            shutil.copy(img, os.path.join(root, "train", "mushroom"))
+        label = "mushroom" if dataset_path == mushroom_path else "no-mushroom"
+        shutil.copy(img, OUTPUT_DIR / "train" / label)
 
     for img in val_images:
-        if dataset_path != mushroom_path:
-            os.makedirs(os.path.join(root, "val", "no-mushroom"), exist_ok=True)
-            shutil.copy(img, os.path.join(root, "val", "no-mushroom"))
-        else:
-            os.makedirs(os.path.join(root, "val", "mushroom"), exist_ok=True)
-            shutil.copy(img, os.path.join(root, "val", "mushroom"))
+        label = "mushroom" if dataset_path == mushroom_path else "no-mushroom"
+        shutil.copy(img, OUTPUT_DIR / "val" / label)
 
     for img in test_images:
-        if dataset_path != mushroom_path:
-            os.makedirs(os.path.join(root, "test", "no-mushroom"), exist_ok=True)
-            shutil.copy(img, os.path.join(root, "test", "no-mushroom"))
-        else:
-            os.makedirs(os.path.join(root, "test", "mushroom"), exist_ok=True)
-            shutil.copy(img, os.path.join(root, "test", "mushroom"))
+        label = "mushroom" if dataset_path == mushroom_path else "no-mushroom"
+        shutil.copy(img, OUTPUT_DIR / "test" / label)

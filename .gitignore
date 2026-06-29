@@ -244,3 +244,15 @@ classification/hailo/artifacts/*.npy
 .metaflow
 mlflow.db*
 mlruns
+
+# Model weights and exported artifacts (too large for git)
+*.pt
+*.pth
+*.onnx
+*.onnx.data
+*.hef
+*.har
+*.engine
+*.tflite
+*.caffemodel
+*.weights
