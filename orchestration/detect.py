@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 def letterbox(image, size=640):
@@ -19,7 +19,7 @@ def letterbox(image, size=640):
     return canvas, scale, pad_x, pad_y
 
 
-def detect(image_path, model_path, threshold=0.25):
+def detect(image_path, model_path, threshold=0.60):
     import onnxruntime as ort
 
     image = Image.open(image_path).convert("RGB")
@@ -74,14 +74,33 @@ def crop(image_path, detection, padding=0.08):
     return image.crop(box)
 
 
+def save_boxes(image_path, detections, output_path):
+    image = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(image)
+
+    for detection in detections:
+        x1, y1, x2, y2 = detection["box"]
+        label = f"{detection['label']} {detection['confidence'] * 100:.1f}%"
+        draw.rectangle((x1, y1, x2, y2), outline="red", width=4)
+        draw.text((x1 + 4, y1 + 4), label, fill="red")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+    return output_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run mushroom detection only.")
     parser.add_argument("image", type=Path)
     parser.add_argument("--model", type=Path, default=Path("exported_models/detection.onnx"))
-    parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--threshold", type=float, default=0.60)
+    parser.add_argument("--save", type=Path)
     args = parser.parse_args()
 
-    print(json.dumps(detect(args.image, args.model, args.threshold), indent=2))
+    detections = detect(args.image, args.model, args.threshold)
+    if args.save:
+        save_boxes(args.image, detections, args.save)
+    print(json.dumps(detections, indent=2))
 
 
 if __name__ == "__main__":
