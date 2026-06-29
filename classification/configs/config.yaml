@@ -44,6 +44,10 @@ quantize:
     batch_size: 8
     batches: 32
   max_onnx_accuracy_drop: 0.05
+  # When true, the export step raises RuntimeError if INT8 ONNX accuracy drop
+  # or SNR falls below thresholds.  When false (default) it prints warnings
+  # and continues so you can inspect the artifacts and decide manually.
+  strict_onnx_validation: false
   snr:
     batch_size: 8
     batches: 16  # cap on calibration batches for SNR (dB) scoring
