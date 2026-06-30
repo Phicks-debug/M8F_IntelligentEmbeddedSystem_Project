@@ -19,7 +19,7 @@ def letterbox(image, size=640):
     return canvas, scale, pad_x, pad_y
 
 
-def detect(image_path, model_path, threshold=0.60):
+def detect(image_path, model_path, threshold=0.60, return_best=False):
     import onnxruntime as ort
 
     image = Image.open(image_path).convert("RGB")
@@ -34,10 +34,9 @@ def detect(image_path, model_path, threshold=0.60):
     output = np.asarray(session.run(None, {input_name: batch})[0])
 
     results = []
+    best_candidate = None
     for row in output[0]:
         x1, y1, x2, y2, confidence, class_id = row.tolist()
-        if confidence < threshold:
-            continue
 
         box = [
             max(0, min(width, (x1 - pad_x) / scale)),
@@ -48,16 +47,21 @@ def detect(image_path, model_path, threshold=0.60):
         if box[2] <= box[0] or box[3] <= box[1]:
             continue
 
-        results.append(
-            {
-                "label": "mushroom",
-                "confidence": float(confidence),
-                "class_id": int(class_id),
-                "box": box,
-            }
-        )
+        candidate = {
+            "label": "mushroom",
+            "confidence": float(confidence),
+            "class_id": int(class_id),
+            "box": box,
+        }
+        if best_candidate is None or candidate["confidence"] > best_candidate["confidence"]:
+            best_candidate = candidate
+        if confidence >= threshold:
+            results.append(candidate)
 
-    return sorted(results, key=lambda item: item["confidence"], reverse=True)
+    results = sorted(results, key=lambda item: item["confidence"], reverse=True)
+    if return_best:
+        return results, best_candidate
+    return results
 
 
 def crop(image_path, detection, padding=0.08):
@@ -97,10 +101,24 @@ def main():
     parser.add_argument("--save", type=Path)
     args = parser.parse_args()
 
-    detections = detect(args.image, args.model, args.threshold)
+    detections, best_candidate = detect(
+        args.image,
+        args.model,
+        args.threshold,
+        return_best=True,
+    )
     if args.save:
         save_boxes(args.image, detections, args.save)
-    print(json.dumps(detections, indent=2))
+    print(
+        json.dumps(
+            {
+                "detections": detections,
+                "best_detection": best_candidate,
+                "threshold": args.threshold,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

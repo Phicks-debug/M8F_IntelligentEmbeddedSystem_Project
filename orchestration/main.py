@@ -18,7 +18,12 @@ def run(
     topk,
     save_detection=None,
 ):
-    detections = detect(image_path, detector_path, threshold)
+    detections, best_candidate = detect(
+        image_path,
+        detector_path,
+        threshold,
+        return_best=True,
+    )
     if save_detection:
         save_boxes(image_path, detections, save_detection)
 
@@ -27,6 +32,8 @@ def run(
             "image": str(image_path),
             "detection_image": str(save_detection) if save_detection else None,
             "detection": None,
+            "best_detection": best_candidate,
+            "threshold": threshold,
             "classification": None,
             "message": "No mushroom detection passed the confidence threshold.",
             "safety_warning": SAFETY_WARNING,
@@ -45,6 +52,8 @@ def run(
         "image": str(image_path),
         "detection_image": str(save_detection) if save_detection else None,
         "detection": best,
+        "best_detection": best,
+        "threshold": threshold,
         "num_detections": len(detections),
         "classification": predictions,
         "safety_warning": SAFETY_WARNING,
@@ -53,8 +62,13 @@ def run(
 
 def format_output(result):
     if result["detection"] is None:
+        best_detection = result["best_detection"]
         lines = [
             "Detection: no mushroom found",
+            f"Best detector guess: {best_detection['confidence'] * 100:.2f}% "
+            f"(threshold: {result['threshold'] * 100:.2f}%)"
+            if best_detection
+            else "Best detector guess: none",
             result["message"],
             f"Detection image: {result['detection_image']}"
             if result["detection_image"]
