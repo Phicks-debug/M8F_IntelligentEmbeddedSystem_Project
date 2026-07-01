@@ -17,6 +17,7 @@ numpy
 psutil>=5.9   # live RAM snapshot in run_finetune / run_distill
 fsspec>=2024.6
 s3fs>=2024.6  # S3 and Cloudflare R2 object-store staging/sync
+botocore[crt]>=1.34  # AWS S3 credential provider
 
 # Quantization (optional)
 torchao>=0.4
