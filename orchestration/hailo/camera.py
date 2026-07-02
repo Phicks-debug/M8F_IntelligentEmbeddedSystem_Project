@@ -24,7 +24,7 @@ def crop_image(image, detection, padding=0.08):
     return image.crop(box)
 
 
-def draw_boxes(image, detections):
+def draw_preview(image, detections, best_detection, predictions, threshold):
     image = image.copy()
     draw = ImageDraw.Draw(image)
 
@@ -34,7 +34,40 @@ def draw_boxes(image, detections):
         draw.rectangle((x1, y1, x2, y2), outline="red", width=4)
         draw.text((x1 + 4, y1 + 4), label, fill="red")
 
+    lines = []
+    if detections and predictions:
+        detection = detections[0]
+        best = predictions[0]
+        lines = [
+            f"Detection: mushroom {detection['confidence'] * 100:.1f}%",
+            f"Species: {best['name']} {best['confidence'] * 100:.1f}%",
+            f"Edibility: {best['edibility']}",
+        ]
+    elif best_detection:
+        lines = [
+            "Detection: no mushroom",
+            f"Best guess: {best_detection['confidence'] * 100:.1f}%",
+            f"Threshold: {threshold * 100:.1f}%",
+        ]
+    else:
+        lines = ["Detection: no mushroom"]
+
+    y = 16
+    for line in lines:
+        draw.rectangle((12, y - 4, 520, y + 22), fill="black")
+        draw.text((20, y), line, fill="white")
+        y += 30
+
     return image
+
+
+def show_preview(image, window_name):
+    import cv2
+    import numpy as np
+
+    frame = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+    cv2.imshow(window_name, frame)
+    return cv2.waitKey(1) & 0xFF != ord("q")
 
 
 def open_picamera(width, height):
@@ -141,8 +174,28 @@ def run_camera(args):
                             )
                         )
 
+                    preview = None
+                    if args.display or args.save_latest:
+                        preview = draw_preview(
+                            image,
+                            detections,
+                            best_detection,
+                            predictions,
+                            args.threshold,
+                        )
+
+                    if args.display and not show_preview(preview, args.window_name):
+                        break
+
                     if args.save_latest:
-                        preview = draw_boxes(image, detections)
+                        if preview is None:
+                            preview = draw_preview(
+                                image,
+                                detections,
+                                best_detection,
+                                predictions,
+                                args.threshold,
+                            )
                         args.save_latest.parent.mkdir(parents=True, exist_ok=True)
                         preview.save(args.save_latest)
 
@@ -162,6 +215,10 @@ def run_camera(args):
     except KeyboardInterrupt:
         print("Stopped camera inference.")
     finally:
+        if args.display:
+            import cv2
+
+            cv2.destroyAllWindows()
         if args.backend == "picamera2":
             camera.stop()
         else:
@@ -189,6 +246,8 @@ def main():
     parser.add_argument("--frames", type=int, default=0)
     parser.add_argument("--print-seconds", type=float, default=1.0)
     parser.add_argument("--save-latest", type=Path)
+    parser.add_argument("--display", action="store_true")
+    parser.add_argument("--window-name", default="Mushroom detection")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
