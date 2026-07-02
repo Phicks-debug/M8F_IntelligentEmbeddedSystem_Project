@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mushroom AI Embedded Pipeline</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@500;700;800&display=swap" rel="stylesheet">
+  <style>
+    /* === FIXED 16:9 VIEWPORT === */
+    :root {
+      --w: 1920;
+      --h: 1080;
+      --bg: #05060d;
+      --ink: #f7f8ff;
+      --muted: #9aa7bd;
+      --blue: #4cc9ff;
+      --lime: #b9ff46;
+      --pink: #ff3df2;
+      --orange: #ff9d35;
+      --panel: rgba(8, 14, 30, 0.78);
+      --line: rgba(76, 201, 255, 0.34);
+      --grid: rgba(76, 201, 255, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #02030a;
+      color: var(--ink);
+      font-family: "Outfit", sans-serif;
+    }
+
+    .viewport {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+    }
+
+    .deck {
+      position: relative;
+      width: 1920px;
+      height: 1080px;
+      transform-origin: center center;
+      overflow: hidden;
+    }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      width: 1920px;
+      height: 1080px;
+      padding: 72px 88px;
+      visibility: hidden;
+      opacity: 0;
+      pointer-events: none;
+      overflow: hidden;
+      background:
+        linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+        linear-gradient(0deg, var(--grid) 1px, transparent 1px),
+        radial-gradient(circle at 16% 16%, rgba(255, 61, 242, 0.20), transparent 28%),
+        radial-gradient(circle at 84% 18%, rgba(76, 201, 255, 0.21), transparent 30%),
+        radial-gradient(circle at 66% 90%, rgba(185, 255, 70, 0.12), transparent 32%),
+        linear-gradient(135deg, #05060d 0%, #071529 52%, #0a0814 100%);
+      background-size: 56px 56px, 56px 56px, auto, auto, auto, auto;
+      transition: opacity 320ms ease, visibility 320ms ease;
+    }
+
+    .slide::before {
+      content: "";
+      position: absolute;
+      inset: 26px;
+      border: 2px solid rgba(76, 201, 255, 0.20);
+      pointer-events: none;
+    }
+
+    .slide::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 6px;
+      background: linear-gradient(90deg, var(--pink), var(--blue), var(--lime));
+      box-shadow: 0 0 28px rgba(76, 201, 255, 0.65);
+    }
+
+    .slide.active {
+      visibility: visible;
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+
+    /* === TYPE SYSTEM === */
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    h1 {
+      font-family: "Archivo Black", sans-serif;
+      font-size: 128px;
+      line-height: 0.88;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h2 {
+      font-family: "Archivo Black", sans-serif;
+      font-size: 82px;
+      line-height: 0.92;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h3 {
+      font-size: 34px;
+      line-height: 1.05;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    p {
+      font-size: 28px;
+      line-height: 1.18;
+      color: var(--muted);
+    }
+
+    .mono,
+    .tag,
+    .kicker,
+    .nav,
+    .num,
+    .micro,
+    .metric-label,
+    code {
+      font-family: "JetBrains Mono", monospace;
+    }
+
+    .kicker {
+      color: var(--lime);
+      font-size: 20px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0;
+      margin-bottom: 24px;
+    }
+
+    .lead {
+      max-width: 860px;
+      margin-top: 26px;
+      font-size: 34px;
+      color: #dfe9ff;
+    }
+
+    .micro {
+      color: rgba(247, 248, 255, 0.58);
+      font-size: 17px;
+      text-transform: uppercase;
+    }
+
+    .blue { color: var(--blue); }
+    .lime { color: var(--lime); }
+    .pink { color: var(--pink); }
+    .orange { color: var(--orange); }
+
+    /* === CORE COMPONENTS === */
+    .topbar {
+      position: absolute;
+      left: 88px;
+      right: 88px;
+      top: 44px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 5;
+    }
+
+    .num {
+      position: absolute;
+      right: 88px;
+      bottom: 48px;
+      color: rgba(247, 248, 255, 0.58);
+      font-size: 18px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      padding: 7px 12px;
+      color: var(--lime);
+      border: 1px solid rgba(185, 255, 70, 0.52);
+      background: rgba(185, 255, 70, 0.08);
+      font-size: 15px;
+      text-transform: uppercase;
+    }
+
+    .panel {
+      border: 2px solid var(--line);
+      background: var(--panel);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 26px 80px rgba(0, 0, 0, 0.48);
+    }
+
+    .image-frame {
+      position: relative;
+      overflow: hidden;
+      border: 2px solid rgba(76, 201, 255, 0.42);
+      background: rgba(255, 255, 255, 0.04);
+      box-shadow: 0 0 48px rgba(76, 201, 255, 0.18);
+    }
+
+    .image-frame img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      filter: saturate(1.12) contrast(1.07);
+    }
+
+    .image-frame.contain img {
+      object-fit: contain;
+      background: #05060d;
+    }
+
+    .caption {
+      position: absolute;
+      left: 18px;
+      bottom: 18px;
+      padding: 8px 12px;
+      color: var(--ink);
+      background: rgba(0, 0, 0, 0.66);
+      border: 1px solid rgba(247, 248, 255, 0.22);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 15px;
+      text-transform: uppercase;
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(22px);
+      animation: rise 520ms ease forwards;
+    }
+
+    .reveal:nth-child(2) { animation-delay: 80ms; }
+    .reveal:nth-child(3) { animation-delay: 150ms; }
+    .reveal:nth-child(4) { animation-delay: 220ms; }
+    .reveal:nth-child(5) { animation-delay: 290ms; }
+
+    @keyframes rise {
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    /* === SLIDE SPECIFIC LAYOUTS === */
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 0.96fr 1.04fr;
+      gap: 58px;
+      height: 100%;
+      align-items: center;
+      padding-top: 34px;
+    }
+
+    .hero-visual {
+      position: relative;
+      height: 780px;
+    }
+
+    .hero-photo-a {
+      position: absolute;
+      left: 0;
+      top: 72px;
+      width: 450px;
+      height: 600px;
+      transform: rotate(-3deg);
+    }
+
+    .hero-photo-b {
+      position: absolute;
+      right: 0;
+      top: 0;
+      width: 520px;
+      height: 690px;
+      transform: rotate(4deg);
+    }
+
+    .neon-core {
+      position: absolute;
+      left: 290px;
+      top: 250px;
+      width: 270px;
+      height: 270px;
+      border: 2px solid var(--lime);
+      background: rgba(185, 255, 70, 0.12);
+      display: grid;
+      place-items: center;
+      font-family: "Archivo Black", sans-serif;
+      color: var(--lime);
+      font-size: 54px;
+      box-shadow: 0 0 60px rgba(185, 255, 70, 0.38);
+    }
+
+    .three-facts {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 26px;
+      margin-top: 58px;
+    }
+
+    .fact {
+      min-height: 255px;
+      padding: 30px;
+      border: 2px solid rgba(247, 248, 255, 0.16);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .fact strong {
+      display: block;
+      font-size: 64px;
+      line-height: 0.9;
+      margin-bottom: 20px;
+    }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 18px;
+      margin-top: 70px;
+    }
+
+    .node {
+      position: relative;
+      min-height: 260px;
+      padding: 28px;
+      border: 2px solid rgba(76, 201, 255, 0.42);
+      background: linear-gradient(180deg, rgba(76, 201, 255, 0.11), rgba(255, 255, 255, 0.035));
+    }
+
+    .node:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      right: -20px;
+      top: 115px;
+      width: 22px;
+      height: 22px;
+      border-top: 5px solid var(--lime);
+      border-right: 5px solid var(--lime);
+      transform: rotate(45deg);
+      z-index: 3;
+    }
+
+    .node .icon {
+      font-family: "Archivo Black", sans-serif;
+      font-size: 58px;
+      color: var(--pink);
+      margin-bottom: 35px;
+    }
+
+    .node p {
+      margin-top: 12px;
+      font-size: 22px;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 0.8fr 1.2fr;
+      gap: 54px;
+      align-items: center;
+      height: 830px;
+      padding-top: 52px;
+    }
+
+    .compact-list {
+      display: grid;
+      gap: 18px;
+      margin-top: 40px;
+    }
+
+    .line-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 18px 22px;
+      border-left: 7px solid var(--blue);
+      background: rgba(76, 201, 255, 0.08);
+    }
+
+    .line-item span:first-child {
+      font-size: 25px;
+      font-weight: 800;
+    }
+
+    .line-item span:last-child {
+      color: var(--lime);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 18px;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 22px;
+      margin-top: 58px;
+    }
+
+    .metric {
+      min-height: 260px;
+      padding: 30px;
+      border: 2px solid rgba(185, 255, 70, 0.42);
+      background: rgba(185, 255, 70, 0.075);
+    }
+
+    .metric-value {
+      font-family: "Archivo Black", sans-serif;
+      color: var(--lime);
+      font-size: 72px;
+      line-height: 0.88;
+      margin-bottom: 24px;
+    }
+
+    .metric-label {
+      color: #dfe9ff;
+      font-size: 19px;
+      line-height: 1.25;
+      text-transform: uppercase;
+    }
+
+    .artifact-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 30px;
+      margin-top: 48px;
+    }
+
+    .artifact {
+      padding: 34px;
+      min-height: 250px;
+    }
+
+    .artifact h3 {
+      margin-bottom: 24px;
+    }
+
+    .artifact .big {
+      font-family: "Archivo Black", sans-serif;
+      font-size: 62px;
+      color: var(--blue);
+      line-height: 0.95;
+    }
+
+    .demo-layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 26px;
+      margin-top: 42px;
+    }
+
+    .demo-layout .image-frame {
+      height: 640px;
+    }
+
+    .closing {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 44px;
+      margin-top: 60px;
+    }
+
+    .next-list {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+    }
+
+    .next {
+      min-height: 145px;
+      padding: 24px;
+      border: 2px solid rgba(255, 61, 242, 0.35);
+      background: rgba(255, 61, 242, 0.08);
+    }
+
+    .next h3 {
+      color: var(--pink);
+      margin-bottom: 12px;
+    }
+
+    /* === NAVIGATION === */
+    .nav {
+      position: fixed;
+      z-index: 30;
+      left: 50%;
+      bottom: 16px;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 9px 12px;
+      border: 1px solid rgba(76, 201, 255, 0.28);
+      border-radius: 999px;
+      color: rgba(247, 248, 255, 0.72);
+      background: rgba(0, 0, 0, 0.66);
+      backdrop-filter: blur(10px);
+      font-size: 14px;
+    }
+
+    .nav button {
+      border: 0;
+      border-radius: 999px;
+      padding: 6px 11px;
+      color: #02030a;
+      background: var(--lime);
+      font: inherit;
+      cursor: pointer;
+    }
+
+    /* === PRINT EXPORT === */
+    @page {
+      size: 16in 9in;
+      margin: 0;
+    }
+
+    @media print {
+      html,
+      body {
+        width: 16in;
+        height: auto;
+        overflow: visible;
+        background: #05060d;
+      }
+
+      .viewport {
+        position: static;
+        display: block;
+      }
+
+      .deck {
+        transform: none !important;
+        width: 16in;
+        height: auto;
+      }
+
+      .slide {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        visibility: visible;
+        opacity: 1;
+        page-break-after: always;
+        transform-origin: top left;
+        transform: scale(0.8);
+      }
+
+      .reveal {
+        opacity: 1 !important;
+        transform: none !important;
+        animation: none !important;
+      }
+
+      .nav {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="viewport">
+    <section class="deck" id="deck">
+      <!-- === SLIDE 1: TITLE === -->
+      <article class="slide active">
+        <div class="topbar"><span class="micro">M8F Intelligent Embedded Systems</span><span class="tag">AI + Edge NPU</span></div>
+        <div class="hero-grid">
+          <div>
+            <div class="kicker reveal">Mushroom safety support</div>
+            <h1 class="reveal">Detect.<br><span class="blue">Classify.</span><br><span class="lime">Warn.</span></h1>
+            <p class="lead reveal">Camera input becomes a bounding box, species prediction, and edibility warning on Raspberry Pi + Hailo.</p>
+          </div>
+          <div class="hero-visual reveal">
+            <div class="image-frame hero-photo-a"><img src="../outputs/mushroom_detection.jpg" alt="Mushroom detection output"><span class="caption">Detection output</span></div>
+            <div class="image-frame hero-photo-b"><img src="../outputs/agaricus_artificial_test_detection.jpg" alt="Artificial mushroom video detection"><span class="caption">Video frame test</span></div>
+            <div class="neon-core">AI</div>
+          </div>
+        </div>
+        <div class="num">01 / 08</div>
+      </article>
+
+      <!-- === SLIDE 2: INTRODUCTION === -->
+      <article class="slide">
+        <div class="topbar"><span class="micro">Introduction</span><span class="tag">What and why</span></div>
+        <div class="kicker reveal">Application</div>
+        <h2 class="reveal">A field-assist vision system</h2>
+        <div class="three-facts">
+          <div class="fact reveal"><strong class="blue">01</strong><h3>Find the mushroom</h3><p>Detector decides whether the frame contains a mushroom candidate.</p></div>
+          <div class="fact reveal"><strong class="lime">02</strong><h3>Name the species</h3><p>Classifier predicts one of the trained mushroom classes.</p></div>
+          <div class="fact reveal"><strong class="pink">03</strong><h3>Return warning</h3><p>Species is mapped to conservative edibility guidance.</p></div>
+        </div>
+        <div class="num">02 / 08</div>
+      </article>
+
+      <!-- === SLIDE 3: BLOCK DIAGRAM === -->
+      <article class="slide">
+        <div class="topbar"><span class="micro">High-level overview</span><span class="tag">Functional blocks</span></div>
+        <div class="kicker reveal">Connectivity</div>
+        <h2 class="reveal">Full pipeline</h2>
+        <div class="pipeline reveal">
+          <div class="node"><div class="icon">IN</div><h3>Camera / image</h3><p>RGB frame</p></div>
+          <div class="node"><div class="icon">BOX</div><h3>Detection</h3><p>YOLO HEF or ONNX</p></div>
+          <div class="node"><div class="icon">CUT</div><h3>Crop</h3><p>Best box + padding</p></div>
+          <div class="node"><div class="icon">ID</div><h3>Classification</h3><p>MobileNetV4</p></div>
+          <div class="node"><div class="icon">OUT</div><h3>Result</h3><p>Species + confidence + edibility</p></div>
+        </div>
+        <div class="num">03 / 08</div>
+      </article>
+
+      <!-- === SLIDE 4: DATA AND TRAINING === -->
+      <article class="slide">
+        <div class="topbar"><span class="micro">Technical details</span><span class="tag">Data + training</span></div>
+        <div class="split">
+          <div>
+            <div class="kicker reveal">Training pipeline</div>
+            <h2 class="reveal">Data to deployable model</h2>
+            <p class="lead reveal">Raw mushroom images are cleaned, split, trained, distilled, quantized, and exported.</p>
+          </div>
+          <div class="compact-list reveal">
+            <div class="line-item"><span>Acquire</span><span>iNaturalist / GBIF / DF20</span></div>
+            <div class="line-item"><span>Clean</span><span>min size + dedup</span></div>
+            <div class="line-item"><span>Split</span><span>70 / 15 / 15</span></div>
+            <div class="line-item"><span>Train</span><span>EfficientNet-B3 -> MobileNetV4</span></div>
+            <div class="line-item"><span>Compress</span><span>distill + INT8 export</span></div>
+          </div>
+        </div>
+        <div class="num">04 / 08</div>
+      </article>
+
+      <!-- === SLIDE 5: MODEL RESULTS === -->
+      <article class="slide">
+        <div class="topbar"><span class="micro">Testing and analysis</span><span class="tag">Model numbers</span></div>
+        <div class="kicker reveal">Classification export</div>
+        <h2 class="reveal">Accuracy stayed usable after INT8</h2>
+        <div class="metrics reveal">
+          <div class="metric"><div class="metric-value">89.2%</div><div class="metric-label">FP32 ONNX accuracy</div></div>
+          <div class="metric"><div class="metric-value">87.1%</div><div class="metric-label">INT8 ONNX accuracy</div></div>
+          <div class="metric"><div class="metric-value">2.1%</div><div class="metric-label">Accuracy drop</div></div>
+          <div class="metric"><div class="metric-value">2.8</div><div class="metric-label">MB INT8 ONNX size</div></div>
+        </div>
+        <div class="artifact-grid">
+          <div class="artifact panel reveal"><h3>Pass condition</h3><div class="big">drop &lt; 5%</div></div>
+          <div class="artifact panel reveal"><h3>Watch item</h3><div class="big pink">SNR warn</div></div>
+        </div>
+        <div class="num">05 / 08</div>
+      </article>
+
+      <!-- === SLIDE 6: DEPLOYMENT === -->
+      <article class="slide">
+        <div class="topbar"><span class="micro">Technical details</span><span class="tag">Deployment</span></div>
+        <div class="split">
+          <div>
+            <div class="kicker reveal">Target hardware</div>
+            <h2 class="reveal">Raspberry Pi + Hailo-10H</h2>
+            <p class="lead reveal">Laptop uses ONNX/TorchScript. The Pi uses `.hef` models through HailoRT.</p>
+          </div>
+          <div class="artifact-grid reveal">
+            <div class="artifact panel"><h3>Detector</h3><div class="big">detection.hef</div><p>Finds bounding boxes.</p></div>
+            <div class="artifact panel"><h3>Classifier</h3><div class="big lime">mobilenetv4_int8.hef</div><p>Predicts species.</p></div>
+            <div class="artifact panel"><h3>Runtime fix</h3><div class="big blue">shared device</div><p>One Hailo accelerator, two models.</p></div>
+            <div class="artifact panel"><h3>Live view</h3><div class="big pink">Picamera2</div><p>Display with overlay.</p></div>
+          </div>
+        </div>
+        <div class="num">06 / 08</div>
+      </article>
+
+      <!-- === SLIDE 7: DEMO VISUALS === -->
+      <article class="slide">
+        <div class="topbar"><span class="micro">Demo and test images</span><span class="tag">Outputs</span></div>
+        <div class="kicker reveal">Visual evidence</div>
+        <h2 class="reveal">Detection before classification</h2>
+        <div class="demo-layout reveal">
+          <div class="image-frame"><img src="../outputs/updated_mushroom_detection.jpg" alt="Updated mushroom detection"><span class="caption">Mushroom accepted</span></div>
+          <div class="image-frame"><img src="../outputs/agaricus_artificial_test_detection.jpg" alt="Artificial Agaricus detection"><span class="caption">Video best frame</span></div>
+          <div class="image-frame"><img src="../outputs/updated_papa_snoop_detection.jpg" alt="Negative image detection test"><span class="caption">Negative test</span></div>
+        </div>
+        <div class="num">07 / 08</div>
+      </article>
+
+      <!-- === SLIDE 8: CONCLUSION === -->
+      <article class="slide">
+        <div class="topbar"><span class="micro">Conclusion</span><span class="tag">Status</span></div>
+        <div class="kicker reveal">Final state</div>
+        <h2 class="reveal">Working pipeline, clear next tuning</h2>
+        <div class="closing">
+          <div class="panel reveal" style="padding:42px;">
+            <h3 class="lime">Built</h3>
+            <div class="compact-list">
+              <div class="line-item"><span>Image pipeline</span><span>done</span></div>
+              <div class="line-item"><span>Video best frame</span><span>done</span></div>
+              <div class="line-item"><span>Live Pi camera</span><span>running</span></div>
+              <div class="line-item"><span>Edibility map</span><span>integrated</span></div>
+            </div>
+          </div>
+          <div class="next-list reveal">
+            <div class="next"><h3>Detector tuning</h3><p>Fix HEF post-processing and confidence scaling.</p></div>
+            <div class="next"><h3>Speed</h3><p>Add frame skipping and lower live resolution.</p></div>
+            <div class="next"><h3>Calibration</h3><p>Use Pi-camera frames for Hailo quantization.</p></div>
+            <div class="next"><h3>Dataset</h3><p>More classes, more real-world images.</p></div>
+          </div>
+        </div>
+        <p class="lead reveal" style="max-width:1180px;margin-top:44px;">Safety rule: this is decision support, not a certified edible-mushroom authority.</p>
+        <div class="num">08 / 08</div>
+      </article>
+    </section>
+  </main>
+
+  <nav class="nav" aria-label="Presentation navigation">
+    <button id="prev" type="button">Prev</button>
+    <span id="counter">1 / 8</span>
+    <button id="next" type="button">Next</button>
+    <span>Arrows / Space</span>
+  </nav>
+
+  <script>
+    /* === SCALE AND NAVIGATE === */
+    const deck = document.getElementById("deck");
+    const slides = Array.from(document.querySelectorAll(".slide"));
+    const counter = document.getElementById("counter");
+    let current = 0;
+
+    function scaleDeck() {
+      const scale = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+      deck.style.transform = `scale(${scale})`;
+    }
+
+    function showSlide(index) {
+      current = Math.max(0, Math.min(slides.length - 1, index));
+      slides.forEach((slide, slideIndex) => {
+        slide.classList.toggle("active", slideIndex === current);
+      });
+      counter.textContent = `${current + 1} / ${slides.length}`;
+      window.location.hash = `slide-${current + 1}`;
+    }
+
+    document.getElementById("next").addEventListener("click", () => showSlide(current + 1));
+    document.getElementById("prev").addEventListener("click", () => showSlide(current - 1));
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowRight" || event.key === " ") showSlide(current + 1);
+      if (event.key === "ArrowLeft") showSlide(current - 1);
+    });
+    window.addEventListener("resize", scaleDeck);
+
+    const hashMatch = window.location.hash.match(/slide-(\d+)/);
+    if (hashMatch) showSlide(Number(hashMatch[1]) - 1);
+    scaleDeck();
+  </script>
+</body>
+</html>

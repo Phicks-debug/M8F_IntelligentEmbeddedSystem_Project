@@ -93,13 +93,43 @@ def detection_rows(output):
     return decode_yolo_output(output)
 
 
-def detect_image(image, detector, threshold=0.60, return_best=False):
+def output_stats(output):
+    if isinstance(output, dict):
+        return {
+            name: {
+                "shape": list(np.asarray(value).shape),
+                "min": float(np.asarray(value).min()),
+                "max": float(np.asarray(value).max()),
+                "mean": float(np.asarray(value).mean()),
+            }
+            for name, value in output.items()
+        }
+
+    output = np.asarray(output)
+    return {
+        "shape": list(output.shape),
+        "min": float(output.min()),
+        "max": float(output.max()),
+        "mean": float(output.mean()),
+    }
+
+
+def detect_image(
+    image,
+    detector,
+    threshold=0.60,
+    return_best=False,
+    input_scale=1 / 255,
+    debug=False,
+):
     width, height = image.size
     boxed, scale, pad_x, pad_y = letterbox(image.convert("RGB"))
 
-    batch = np.asarray(boxed, dtype=np.float32) / 255.0
+    batch = np.asarray(boxed, dtype=np.float32) * input_scale
     batch = batch[None]
     output = detector.infer(batch)
+    if debug:
+        print(json.dumps({"detector_output_stats": output_stats(output)}, indent=2))
 
     results = []
     best_candidate = None
@@ -131,9 +161,9 @@ def detect_image(image, detector, threshold=0.60, return_best=False):
     return results
 
 
-def detect(image_path, detector, threshold=0.60, return_best=False):
+def detect(image_path, detector, threshold=0.60, return_best=False, input_scale=1 / 255, debug=False):
     image = Image.open(image_path).convert("RGB")
-    return detect_image(image, detector, threshold, return_best)
+    return detect_image(image, detector, threshold, return_best, input_scale, debug)
 
 
 def main():
@@ -141,6 +171,8 @@ def main():
     parser.add_argument("image", type=Path)
     parser.add_argument("--model", type=Path, default=Path("exported_models/detection.hef"))
     parser.add_argument("--threshold", type=float, default=0.60)
+    parser.add_argument("--input-scale", type=float, default=1 / 255)
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("--save", type=Path)
     args = parser.parse_args()
 
@@ -150,6 +182,8 @@ def main():
             detector,
             args.threshold,
             return_best=True,
+            input_scale=args.input_scale,
+            debug=args.debug,
         )
 
     if args.save:

@@ -28,11 +28,16 @@ def draw_preview(image, detections, best_detection, predictions, threshold):
     image = image.copy()
     draw = ImageDraw.Draw(image)
 
-    for detection in detections:
+    shown_detections = detections
+    if not shown_detections and best_detection:
+        shown_detections = [best_detection]
+
+    for detection in shown_detections:
         x1, y1, x2, y2 = detection["box"]
         label = f"{detection['label']} {detection['confidence'] * 100:.1f}%"
-        draw.rectangle((x1, y1, x2, y2), outline="red", width=4)
-        draw.text((x1 + 4, y1 + 4), label, fill="red")
+        color = "red" if detection in detections else "orange"
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=4)
+        draw.text((x1 + 4, y1 + 4), label, fill=color)
 
     lines = []
     if detections and predictions:
@@ -150,6 +155,8 @@ def run_camera(args):
                             detector,
                             args.threshold,
                             return_best=True,
+                            input_scale=args.detector_input_scale,
+                            debug=args.debug_detector and frame_number == 0,
                         )
 
                         predictions = None
@@ -238,6 +245,7 @@ def main():
         default=Path("data/processed/classification_data"),
     )
     parser.add_argument("--threshold", type=float, default=0.60)
+    parser.add_argument("--detector-input-scale", type=float, default=1 / 255)
     parser.add_argument("--padding", type=float, default=0.08)
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--backend", choices=("picamera2", "opencv"), default="picamera2")
@@ -250,6 +258,7 @@ def main():
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--window-name", default="Mushroom detection")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--debug-detector", action="store_true")
     args = parser.parse_args()
 
     run_camera(args)
