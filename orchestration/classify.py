@@ -12,13 +12,22 @@ IMAGE_SIZE = 224
 RESIZE = 256
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+DEFAULT_CLASSES = Path("orchestration/classes.txt")
 
 
-def class_names(data_dir):
+def class_names(data_dir, classes_path=DEFAULT_CLASSES):
     train_dir = data_dir / "train"
-    if not train_dir.exists():
-        raise FileNotFoundError(f"Missing training split: {train_dir}")
-    return sorted(path.name for path in train_dir.iterdir() if path.is_dir())
+    if train_dir.exists():
+        return sorted(path.name for path in train_dir.iterdir() if path.is_dir())
+    if classes_path.exists():
+        return [
+            line.strip()
+            for line in classes_path.read_text().splitlines()
+            if line.strip()
+        ]
+    raise FileNotFoundError(
+        f"Missing training split: {train_dir} and class list: {classes_path}"
+    )
 
 
 def preprocess(image):

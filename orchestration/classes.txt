@@ -1,0 +1,8 @@
+Agaricus_bisporus
+Amanita_muscaria
+Boletus_edulis
+Cantharellus_cibarius
+Coprinus_comatus
+Laetiporus_sulphureus
+Morchella_esculenta
+Pleurotus_ostreatus
