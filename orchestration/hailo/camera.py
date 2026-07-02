@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw
 from orchestration.classify import class_names
 from orchestration.hailo.classify import classify_image
 from orchestration.hailo.detect import detect_image
-from orchestration.hailo.runtime import HailoModel
+from orchestration.hailo.runtime import HailoDevice, HailoModel
 
 
 def crop_image(image, detection, padding=0.08):
@@ -140,55 +140,43 @@ def run_camera(args):
     frame_number = 0
 
     try:
-        with HailoModel(args.detector) as detector:
-            with HailoModel(args.classifier) as classifier:
-                while args.frames <= 0 or frame_number < args.frames:
-                    image = read_frame(camera)
-                    detections, best_detection = detect_image(
-                        image,
-                        detector,
-                        args.threshold,
-                        return_best=True,
-                    )
-
-                    predictions = None
-                    if detections:
-                        mushroom_crop = crop_image(image, detections[0], args.padding)
-                        predictions = classify_image(
-                            mushroom_crop,
-                            classifier,
-                            names,
-                            topk=args.topk,
-                        )
-
-                    now = time.time()
-                    if now - last_print >= args.print_seconds:
-                        last_print = now
-                        print(
-                            format_live_result(
-                                frame_number,
-                                detections,
-                                best_detection,
-                                predictions,
-                                args.threshold,
-                            )
-                        )
-
-                    preview = None
-                    if args.display or args.save_latest:
-                        preview = draw_preview(
+        with HailoDevice() as device:
+            with HailoModel(args.detector, device) as detector:
+                with HailoModel(args.classifier, device) as classifier:
+                    while args.frames <= 0 or frame_number < args.frames:
+                        image = read_frame(camera)
+                        detections, best_detection = detect_image(
                             image,
-                            detections,
-                            best_detection,
-                            predictions,
+                            detector,
                             args.threshold,
+                            return_best=True,
                         )
 
-                    if args.display and not show_preview(preview, args.window_name):
-                        break
+                        predictions = None
+                        if detections:
+                            mushroom_crop = crop_image(image, detections[0], args.padding)
+                            predictions = classify_image(
+                                mushroom_crop,
+                                classifier,
+                                names,
+                                topk=args.topk,
+                            )
 
-                    if args.save_latest:
-                        if preview is None:
+                        now = time.time()
+                        if now - last_print >= args.print_seconds:
+                            last_print = now
+                            print(
+                                format_live_result(
+                                    frame_number,
+                                    detections,
+                                    best_detection,
+                                    predictions,
+                                    args.threshold,
+                                )
+                            )
+
+                        preview = None
+                        if args.display or args.save_latest:
                             preview = draw_preview(
                                 image,
                                 detections,
@@ -196,22 +184,35 @@ def run_camera(args):
                                 predictions,
                                 args.threshold,
                             )
-                        args.save_latest.parent.mkdir(parents=True, exist_ok=True)
-                        preview.save(args.save_latest)
 
-                    if args.json:
-                        print(
-                            json.dumps(
-                                {
-                                    "frame": frame_number,
-                                    "detections": detections,
-                                    "best_detection": best_detection,
-                                    "classification": predictions,
-                                }
+                        if args.display and not show_preview(preview, args.window_name):
+                            break
+
+                        if args.save_latest:
+                            if preview is None:
+                                preview = draw_preview(
+                                    image,
+                                    detections,
+                                    best_detection,
+                                    predictions,
+                                    args.threshold,
+                                )
+                            args.save_latest.parent.mkdir(parents=True, exist_ok=True)
+                            preview.save(args.save_latest)
+
+                        if args.json:
+                            print(
+                                json.dumps(
+                                    {
+                                        "frame": frame_number,
+                                        "detections": detections,
+                                        "best_detection": best_detection,
+                                        "classification": predictions,
+                                    }
+                                )
                             )
-                        )
 
-                    frame_number += 1
+                        frame_number += 1
     except KeyboardInterrupt:
         print("Stopped camera inference.")
     finally:

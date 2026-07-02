@@ -7,7 +7,7 @@ from orchestration.detect import crop, save_boxes
 from orchestration.edibility import SAFETY_WARNING
 from orchestration.hailo.classify import classify_image
 from orchestration.hailo.detect import detect
-from orchestration.hailo.runtime import HailoModel
+from orchestration.hailo.runtime import HailoDevice, HailoModel
 from orchestration.main import format_output
 
 
@@ -81,18 +81,19 @@ def main():
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    with HailoModel(args.detector) as detector:
-        with HailoModel(args.classifier) as classifier:
-            result = run(
-                args.image,
-                detector,
-                classifier,
-                args.data_dir,
-                args.threshold,
-                args.padding,
-                args.topk,
-                args.save_detection,
-            )
+    with HailoDevice() as device:
+        with HailoModel(args.detector, device) as detector:
+            with HailoModel(args.classifier, device) as classifier:
+                result = run(
+                    args.image,
+                    detector,
+                    classifier,
+                    args.data_dir,
+                    args.threshold,
+                    args.padding,
+                    args.topk,
+                    args.save_detection,
+                )
 
     if args.json:
         print(json.dumps(result, indent=2))

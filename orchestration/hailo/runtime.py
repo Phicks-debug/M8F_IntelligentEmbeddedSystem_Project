@@ -1,16 +1,31 @@
 import numpy as np
 
 
+class HailoDevice:
+    def __enter__(self):
+        from hailo_platform import VDevice  # type: ignore
+
+        self.device = VDevice()
+        self.device.__enter__()
+        return self.device
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.device.__exit__(exc_type, exc, traceback)
+
+
 class HailoModel:
-    def __init__(self, hef_path):
+    def __init__(self, hef_path, device=None):
         self.hef_path = str(hef_path)
+        self.device = device
+        self.owns_device = device is None
 
     def __enter__(self):
         from hailo_platform import FormatType, HEF, VDevice  # type: ignore
 
         hef = HEF(self.hef_path)
-        self.device = VDevice()
-        self.device.__enter__()
+        if self.owns_device:
+            self.device = VDevice()
+            self.device.__enter__()
 
         input_info = hef.get_input_vstream_infos()[0]
         output_infos = hef.get_output_vstream_infos()
@@ -32,7 +47,8 @@ class HailoModel:
 
     def __exit__(self, exc_type, exc, traceback):
         self.configured_model.__exit__(exc_type, exc, traceback)
-        self.device.__exit__(exc_type, exc, traceback)
+        if self.owns_device:
+            self.device.__exit__(exc_type, exc, traceback)
 
     def infer(self, batch):
         bindings = self.configured_model.create_bindings()

@@ -6,7 +6,7 @@ from PIL import Image
 
 from orchestration.hailo.detect import detect_image
 from orchestration.hailo.main import run
-from orchestration.hailo.runtime import HailoModel
+from orchestration.hailo.runtime import HailoDevice, HailoModel
 from orchestration.video import format_video_output, frame_score, save_frame
 
 
@@ -119,19 +119,20 @@ def main():
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    with HailoModel(args.detector) as detector:
-        with HailoModel(args.classifier) as classifier:
-            result = run_video(
-                args.video,
-                detector,
-                classifier,
-                args.data_dir,
-                args.threshold,
-                args.padding,
-                args.topk,
-                args.sample_seconds,
-                args.output_dir,
-            )
+    with HailoDevice() as device:
+        with HailoModel(args.detector, device) as detector:
+            with HailoModel(args.classifier, device) as classifier:
+                result = run_video(
+                    args.video,
+                    detector,
+                    classifier,
+                    args.data_dir,
+                    args.threshold,
+                    args.padding,
+                    args.topk,
+                    args.sample_seconds,
+                    args.output_dir,
+                )
 
     if args.json:
         print(json.dumps(result, indent=2))
