@@ -13,13 +13,18 @@ class HailoModel:
         self.device.__enter__()
 
         input_info = hef.get_input_vstream_infos()[0]
-        output_info = hef.get_output_vstream_infos()[0]
+        output_infos = hef.get_output_vstream_infos()
         self.input_name = input_info.name
-        self.output_name = output_info.name
+        self.output_names = [info.name for info in output_infos]
+        self.output_shapes = {
+            info.name: tuple(info.shape)
+            for info in output_infos
+        }
 
         self.model = self.device.create_infer_model(self.hef_path)
         self.model.input().set_format_type(FormatType.FLOAT32)
-        self.model.output().set_format_type(FormatType.FLOAT32)
+        for output_name in self.output_names:
+            self.model.output(output_name).set_format_type(FormatType.FLOAT32)
 
         self.configured_model = self.model.configure()
         self.configured_model.__enter__()
@@ -33,9 +38,13 @@ class HailoModel:
         bindings = self.configured_model.create_bindings()
         bindings.input().set_buffer(batch.astype(np.float32))
 
-        output_shape = tuple(self.model.output().shape)
-        output = np.empty(output_shape, dtype=np.float32)
-        bindings.output().set_buffer(output)
+        outputs = {}
+        for output_name in self.output_names:
+            output = np.empty(self.output_shapes[output_name], dtype=np.float32)
+            bindings.output(output_name).set_buffer(output)
+            outputs[output_name] = output
 
         self.configured_model.run([bindings], timeout_ms=10000)
-        return output
+        if len(outputs) == 1:
+            return next(iter(outputs.values()))
+        return outputs

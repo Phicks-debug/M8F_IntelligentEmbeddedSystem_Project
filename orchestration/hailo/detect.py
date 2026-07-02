@@ -10,6 +10,24 @@ from orchestration.hailo.runtime import HailoModel
 
 
 def detection_rows(output):
+    if isinstance(output, dict):
+        arrays = [
+            np.asarray(value)
+            for value in output.values()
+        ]
+        candidates = [
+            array
+            for array in arrays
+            if array.size and array.shape[-1] == 6
+        ]
+        if not candidates:
+            shapes = {
+                name: list(np.asarray(value).shape)
+                for name, value in output.items()
+            }
+            raise ValueError(f"Could not find detection output with 6 values: {shapes}")
+        output = candidates[0]
+
     output = np.asarray(output)
     if output.ndim == 3:
         output = output[0]
