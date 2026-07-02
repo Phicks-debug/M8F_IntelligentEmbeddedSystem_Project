@@ -143,6 +143,9 @@ def run_camera(args):
 
     last_print = 0.0
     frame_number = 0
+    detections = []
+    best_detection = None
+    predictions = None
 
     try:
         with HailoDevice() as device:
@@ -150,24 +153,26 @@ def run_camera(args):
                 with HailoModel(args.classifier, device) as classifier:
                     while args.frames <= 0 or frame_number < args.frames:
                         image = read_frame(camera)
-                        detections, best_detection = detect_image(
-                            image,
-                            detector,
-                            args.threshold,
-                            return_best=True,
-                            input_scale=args.detector_input_scale,
-                            debug=args.debug_detector and frame_number == 0,
-                        )
 
-                        predictions = None
-                        if detections:
-                            mushroom_crop = crop_image(image, detections[0], args.padding)
-                            predictions = classify_image(
-                                mushroom_crop,
-                                classifier,
-                                names,
-                                topk=args.topk,
+                        if frame_number % args.detect_every == 0:
+                            detections, best_detection = detect_image(
+                                image,
+                                detector,
+                                args.threshold,
+                                return_best=True,
+                                input_scale=args.detector_input_scale,
+                                debug=args.debug_detector and frame_number == 0,
                             )
+
+                            predictions = None
+                            if detections:
+                                mushroom_crop = crop_image(image, detections[0], args.padding)
+                                predictions = classify_image(
+                                    mushroom_crop,
+                                    classifier,
+                                    names,
+                                    topk=args.topk,
+                                )
 
                         now = time.time()
                         if now - last_print >= args.print_seconds:
@@ -248,6 +253,7 @@ def main():
     parser.add_argument("--detector-input-scale", type=float, default=1 / 255)
     parser.add_argument("--padding", type=float, default=0.08)
     parser.add_argument("--topk", type=int, default=3)
+    parser.add_argument("--detect-every", type=int, default=1)
     parser.add_argument("--backend", choices=("picamera2", "opencv"), default="picamera2")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
@@ -261,6 +267,7 @@ def main():
     parser.add_argument("--debug-detector", action="store_true")
     args = parser.parse_args()
 
+    args.detect_every = max(1, args.detect_every)
     run_camera(args)
 
 
