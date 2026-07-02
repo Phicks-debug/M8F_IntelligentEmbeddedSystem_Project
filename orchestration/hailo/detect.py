@@ -104,7 +104,7 @@ def detect_image(image, detector, threshold=0.60, return_best=False):
     results = []
     best_candidate = None
     for row in detection_rows(output):
-        x1, y1, x2, y2, confidence, class_id = row.tolist()
+        x1, y1, x2, y2, confidence, class_id = row
         box = [
             max(0, min(width, (x1 - pad_x) / scale)),
             max(0, min(height, (y1 - pad_y) / scale)),
