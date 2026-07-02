@@ -1,5 +1,5 @@
 {
-  "include": ["classification/src", "classification/configs"],
+  "include": ["classification/src", "classification/configs", "preprocessing/src", "preprocessing/configs"],
   "exclude": [
     ".venv",
     "__pycache__",
